@@ -1,6 +1,7 @@
 BeforeAll {
-    $ScriptPath = Join-Path $PSScriptRoot '..\src\Sync-SnipeItAzure.ps1'
-    $ConfigPath = Join-Path $PSScriptRoot '..\config.example.json'
+    $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
+    $ScriptPath = Join-Path $RepoRoot 'src/Sync-SnipeItAzure.ps1'
+    $ConfigPath = Join-Path $RepoRoot 'config.example.json'
     $ScriptContent = Get-Content -LiteralPath $ScriptPath -Raw
     $ConfigContent = Get-Content -LiteralPath $ConfigPath -Raw
 }
@@ -39,14 +40,30 @@ Describe 'Snipe-IT Azure sync safety contract' {
     It 'centralizes runtime secret loading through a single function' {
         $ScriptContent | Should -Match 'function Get-EnvironmentSecret'
         $ScriptContent | Should -Match 'function New-RuntimeContext'
-        ($ScriptContent | Select-String -Pattern 'Get-EnvironmentVariable' -AllMatches).Matches.Count | Should -Be 1
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable\(' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
+        ($ScriptContent | Select-String -Pattern '\[Environment\]::GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 1
     }
 
     It 'validates duplicate Azure and Snipe-IT match keys before updates' {
         $ScriptContent | Should -Match 'function Test-AzureDuplicateKey'
         $ScriptContent | Should -Match 'function New-AssetLookup'
-        $ScriptContent | Should -Match 'Duplicate Azure device value detected'
-        $ScriptContent | Should -Match 'Duplicate Snipe-IT asset value detected'
+        $ScriptContent | Should -Match 'Duplicate \$SourceName value detected'
     }
 
     It 'validates Snipe-IT semantic responses for write operations' {
