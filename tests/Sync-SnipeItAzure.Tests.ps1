@@ -1,9 +1,9 @@
 BeforeAll {
     $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-    $ConfigPath = Join-Path $RepoRoot 'config.example.json'
-    $SchemaPath = Join-Path $RepoRoot 'config.schema.json'
+    $ExampleConfigPath = Join-Path $RepoRoot 'config.example.json'
+    $ExampleSchemaPath = Join-Path $RepoRoot 'config.schema.json'
     $ScriptPath = Join-Path $RepoRoot 'src/Sync-SnipeItAzure.ps1'
-    $Config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+    $ExampleConfig = Get-Content -LiteralPath $ExampleConfigPath -Raw | ConvertFrom-Json
     $RuntimeScriptPath = Join-Path $TestDrive 'Sync-SnipeItAzure.Runtime.ps1'
     $RuntimeScript = Get-Content -LiteralPath $ScriptPath -Raw
     $RuntimeScript = $RuntimeScript -replace "(?s)if \(\$MyInvocation\.InvocationName -ne '\.'\) \{ Invoke-Main \}\s*$", ''
@@ -13,14 +13,10 @@ BeforeAll {
     function Set-TestRuntime {
         param([object]$RuntimeConfig)
         $Script:Runtime = [pscustomobject]@{
-            Config              = $RuntimeConfig
-            Mode                = 'Plan'
-            SnipeItApiToken     = 'placeholder'
-            AzureTenantId       = 'placeholder'
-            AzureClientId       = 'placeholder'
-            AzureCertThumbprint = 'placeholder'
-            AllowUpdate         = $false
-            NonInteractive      = $false
+            Config         = $RuntimeConfig
+            Mode           = 'Plan'
+            AllowUpdate    = $false
+            NonInteractive = $false
         }
     }
 
@@ -47,20 +43,20 @@ BeforeAll {
 
 Describe 'configuration and schema safety' {
     It 'keeps JSON files parseable' {
-        { Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json } | Should -Not -Throw
-        { Get-Content -LiteralPath $SchemaPath -Raw | ConvertFrom-Json } | Should -Not -Throw
+        { Get-Content -LiteralPath $ExampleConfigPath -Raw | ConvertFrom-Json } | Should -Not -Throw
+        { Get-Content -LiteralPath $ExampleSchemaPath -Raw | ConvertFrom-Json } | Should -Not -Throw
     }
 
     It 'uses update-only plan mode by default' {
-        $Config.Sync.Mode | Should -Be 'Plan'
-        $Config.Sync.PSObject.Properties.Name | Should -Contain 'UpdateFields'
-        $Config.Sync.PSObject.Properties.Name | Should -Not -Contain 'CreateFields'
+        $ExampleConfig.Sync.Mode | Should -Be 'Plan'
+        $ExampleConfig.Sync.PSObject.Properties.Name | Should -Contain 'UpdateFields'
+        $ExampleConfig.Sync.PSObject.Properties.Name | Should -Not -Contain 'CreateFields'
     }
 
     It 'separates reliable and fallback matching' {
-        @($Config.Sync.UniqueMatchPriority) | Should -Contain 'SerialNumber'
-        @($Config.Sync.UniqueMatchPriority) | Should -Not -Contain 'DeviceName'
-        @($Config.Sync.FallbackMatchPriority) | Should -Contain 'DeviceName'
+        @($ExampleConfig.Sync.UniqueMatchPriority) | Should -Contain 'SerialNumber'
+        @($ExampleConfig.Sync.UniqueMatchPriority) | Should -Not -Contain 'DeviceName'
+        @($ExampleConfig.Sync.FallbackMatchPriority) | Should -Contain 'DeviceName'
     }
 }
 
@@ -81,7 +77,7 @@ Describe 'runtime value sourcing' {
 
 Describe 'matching behavior' {
     BeforeEach {
-        Set-TestRuntime -RuntimeConfig $Config
+        Set-TestRuntime -RuntimeConfig $ExampleConfig
     }
 
     It 'normalizes serial values before duplicate detection' {
@@ -107,7 +103,7 @@ Describe 'matching behavior' {
 
 Describe 'payload behavior' {
     BeforeEach {
-        Set-TestRuntime -RuntimeConfig $Config
+        Set-TestRuntime -RuntimeConfig $ExampleConfig
     }
 
     It 'reads custom mapped field values without failing when custom fields are present' {
