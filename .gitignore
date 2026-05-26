@@ -1,0 +1,31 @@
+# Local configuration and secrets
+config.json
+.env
+*.secret
+*.secrets
+*.key
+*.pem
+*.pfx
+secrets/
+
+# Runtime output
+logs/
+reports/
+*.log
+*.jsonl
+*.csv
+
+# PowerShell
+*.ps1xml
+*.pssc
+*.psrc
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Test output
+TestResults/
+coverage/
