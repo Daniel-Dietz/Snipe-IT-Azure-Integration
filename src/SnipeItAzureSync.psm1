@@ -1,4 +1,15 @@
 #requires -Version 7.2
+<#
+.SYNOPSIS
+Production Snipe-IT Azure synchronization module.
+
+.DESCRIPTION
+Synchronizes Microsoft Intune managed-device inventory into existing Snipe-IT assets.
+The module is intentionally update-only and includes conservative runtime safeguards:
+process-scoped runtime secrets, explicit Apply permission, deterministic field mapping,
+custom-field preflight validation, structured redacted logging, and Windows ACL checks.
+#>
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
@@ -103,6 +114,14 @@ function ConvertTo-RedactedValue {
 }
 
 function Write-SyncLog {
+    <#
+    .SYNOPSIS
+    Writes structured JSON logs without polluting the success stream.
+
+    .DESCRIPTION
+    File logging is the durable audit path. PowerShell information-stream emission is opt-in
+    through Logging.EmitInformationStream for interactive troubleshooting only.
+    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][ValidateSet('Debug', 'Info', 'Warning', 'Error')][string]$Level,
@@ -124,7 +143,10 @@ function Write-SyncLog {
     }
 
     $Line = $Entry | ConvertTo-Json -Depth 12 -Compress
-    Write-Information -MessageData $Line -InformationAction Continue
+
+    if ($Script:Runtime -and $Script:Runtime.Config.Logging.PSObject.Properties.Name -contains 'EmitInformationStream' -and [bool]$Script:Runtime.Config.Logging.EmitInformationStream) {
+        Write-Information -MessageData $Line
+    }
 
     if ($Script:Runtime -and $Script:Runtime.Config.Logging.LogPath) {
         Add-Content -LiteralPath $Script:Runtime.Config.Logging.LogPath -Value $Line -Encoding UTF8
@@ -160,12 +182,47 @@ function Resolve-SafeFullPath {
     return [System.IO.Path]::GetFullPath($Expanded)
 }
 
+function Get-ConfiguredWindowsAclPrincipals {
+    <#
+    .SYNOPSIS
+    Builds the effective Windows ACL allow-list.
+
+    .DESCRIPTION
+    SYSTEM, local Administrators, and the current process identity are always trusted.
+    Security.AllowedWindowsPrincipals may add environment-specific service, monitoring,
+    backup, or deployment principals without weakening the default posture.
+    #>
+    [CmdletBinding()]
+    param([Parameter()][AllowNull()][object]$Config)
+
+    $Principals = [System.Collections.Generic.List[string]]::new()
+    if ($IsWindows) {
+        $CurrentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+        foreach ($Principal in @($Script:WindowsTrustedPrincipals + $CurrentIdentity)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$Principal)) { $Principals.Add([string]$Principal) }
+        }
+    }
+    else {
+        foreach ($Principal in @($Script:WindowsTrustedPrincipals)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$Principal)) { $Principals.Add([string]$Principal) }
+        }
+    }
+
+    if ($Config -and $Config.PSObject.Properties.Name -contains 'Security' -and $Config.Security -and $Config.Security.PSObject.Properties.Name -contains 'AllowedWindowsPrincipals') {
+        foreach ($Principal in @($Config.Security.AllowedWindowsPrincipals)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$Principal)) { $Principals.Add([string]$Principal) }
+        }
+    }
+
+    return @($Principals | Select-Object -Unique)
+}
+
 function Get-AllowedWindowsAclPrincipals {
     [CmdletBinding()]
     param()
 
-    $CurrentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-    return @($Script:WindowsTrustedPrincipals + $CurrentIdentity | Select-Object -Unique)
+    $Config = if ($Script:Runtime) { $Script:Runtime.Config } else { $null }
+    return Get-ConfiguredWindowsAclPrincipals -Config $Config
 }
 
 function Test-UnsafeWindowsAccessRule {
@@ -182,16 +239,21 @@ function Test-UnsafeWindowsAccessRule {
 }
 
 function Assert-SafeWindowsAcl {
+    <#
+    .SYNOPSIS
+    Fails when protected files or directories grant access to unapproved principals.
+    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][string]$Purpose
+        [Parameter(Mandatory)][string]$Purpose,
+        [Parameter()][AllowNull()][object]$Config
     )
 
     if (-not $IsWindows) { return }
     $Acl = Get-Acl -LiteralPath $Path
     if (-not $Acl.Owner) { throw "$Purpose path owner could not be determined." }
-    $AllowedPrincipals = Get-AllowedWindowsAclPrincipals
+    $AllowedPrincipals = Get-ConfiguredWindowsAclPrincipals -Config $Config
     $UnsafeRules = @($Acl.Access | Where-Object { Test-UnsafeWindowsAccessRule -Rule $_ -AllowedPrincipals $AllowedPrincipals })
     if ($UnsafeRules.Count -gt 0) {
         $Names = ($UnsafeRules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique) -join ', '
@@ -210,7 +272,6 @@ function Test-SafeConfigPath {
     if ($RequireFullyQualified -and $IsWindows -and -not (Test-WindowsAbsolutePath -Path $Expanded)) { throw 'Config path must be a fully qualified Windows path in non-interactive mode.' }
     $FullPath = Resolve-SafeFullPath -Path $Expanded
     if (-not (Test-Path -LiteralPath $FullPath)) { throw "Configuration file '$Path' was not found." }
-    Assert-SafeWindowsAcl -Path $FullPath -Purpose 'Config file'
     return $FullPath
 }
 
@@ -219,7 +280,8 @@ function Test-SafeOutputPath {
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$Purpose,
-        [Parameter()][switch]$RequireFullyQualified
+        [Parameter()][switch]$RequireFullyQualified,
+        [Parameter()][AllowNull()][object]$Config
     )
 
     $Expanded = [Environment]::ExpandEnvironmentVariables($Path)
@@ -229,8 +291,8 @@ function Test-SafeOutputPath {
     if ([string]::IsNullOrWhiteSpace($Directory)) { throw "$Purpose path must include a directory." }
     if (-not (Test-Path -LiteralPath $Directory)) { New-Item -ItemType Directory -Path $Directory -Force | Out-Null }
     $ResolvedDirectory = (Resolve-Path -LiteralPath $Directory).Path
-    Assert-SafeWindowsAcl -Path $ResolvedDirectory -Purpose "$Purpose directory"
-    if ($IsWindows -and (Test-Path -LiteralPath $FullPath)) { Assert-SafeWindowsAcl -Path $FullPath -Purpose "$Purpose file" }
+    Assert-SafeWindowsAcl -Path $ResolvedDirectory -Purpose "$Purpose directory" -Config $Config
+    if ($IsWindows -and (Test-Path -LiteralPath $FullPath)) { Assert-SafeWindowsAcl -Path $FullPath -Purpose "$Purpose file" -Config $Config }
     if (-not $IsWindows) {
         $Item = Get-Item -LiteralPath $ResolvedDirectory
         $Mode = $Item.UnixFileMode
@@ -240,11 +302,17 @@ function Test-SafeOutputPath {
 }
 
 function Read-SyncConfig {
+    <#
+    .SYNOPSIS
+    Reads configuration and validates the config file ACL after the configured allow-list is known.
+    #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
 
     $ConfigPath = Test-SafeConfigPath -Path $Path -RequireFullyQualified:([bool]$Script:Options.NonInteractive)
     $Config = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 20
+    Assert-SafeWindowsAcl -Path $ConfigPath -Purpose 'Config file' -Config $Config
+
     if (-not $Config.SnipeIt.BaseUrl.StartsWith('https://', [StringComparison]::OrdinalIgnoreCase)) { throw 'Snipe-IT BaseUrl must use HTTPS.' }
     if ($Config.Azure.Source -ne 'IntuneManagedDevices') { throw "Unsupported Azure source '$($Config.Azure.Source)'. Only IntuneManagedDevices is supported." }
     foreach ($Field in @($Config.Sync.UniqueMatchPriority)) { if ($Script:AllowedUniqueMatchFields -notcontains [string]$Field) { throw "Unsupported unique match field '$Field'." } }
@@ -265,8 +333,8 @@ function New-RuntimeContext {
     $EffectiveMode = if ($Script:Options.DryRun) { 'Plan' } elseif ($Script:Options.Mode) { [string]$Script:Options.Mode } elseif ($Config.Sync.Mode) { [string]$Config.Sync.Mode } else { 'Plan' }
     if ($EffectiveMode -eq 'Apply' -and -not $Script:Options.AllowUpdate) { throw 'Apply mode requires explicit -AllowUpdate.' }
     $RequireFullyQualifiedOutput = [bool]$Script:Options.NonInteractive
-    $Config.Logging.LogPath = Test-SafeOutputPath -Path $Config.Logging.LogPath -Purpose 'Log' -RequireFullyQualified:$RequireFullyQualifiedOutput
-    $Config.Logging.ReportPath = Test-SafeOutputPath -Path $Config.Logging.ReportPath -Purpose 'Report' -RequireFullyQualified:$RequireFullyQualifiedOutput
+    $Config.Logging.LogPath = Test-SafeOutputPath -Path $Config.Logging.LogPath -Purpose 'Log' -RequireFullyQualified:$RequireFullyQualifiedOutput -Config $Config
+    $Config.Logging.ReportPath = Test-SafeOutputPath -Path $Config.Logging.ReportPath -Purpose 'Report' -RequireFullyQualified:$RequireFullyQualifiedOutput -Config $Config
     $Context = [pscustomobject]@{
         Config              = $Config
         Mode                = $EffectiveMode
@@ -546,17 +614,32 @@ function Compare-SnipeItPayload {
 }
 
 function Get-ConfiguredCustomFieldMappings {
+    <#
+    .SYNOPSIS
+    Returns configured Snipe-IT custom-field mappings deterministically.
+    #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Config)
-    $Fields = @($Config.Sync.UniqueMatchPriority) + @($Config.Sync.FallbackMatchPriority) + @($Config.Sync.UpdateFields) | Select-Object -Unique
-    foreach ($LogicalField in $Fields) {
+
+    $Fields = [System.Collections.Generic.List[string]]::new()
+    foreach ($Field in @($Config.Sync.UniqueMatchPriority)) { if (-not [string]::IsNullOrWhiteSpace([string]$Field)) { $Fields.Add([string]$Field) } }
+    foreach ($Field in @($Config.Sync.FallbackMatchPriority)) { if (-not [string]::IsNullOrWhiteSpace([string]$Field)) { $Fields.Add([string]$Field) } }
+    foreach ($Field in @($Config.Sync.UpdateFields)) { if (-not [string]::IsNullOrWhiteSpace([string]$Field)) { $Fields.Add([string]$Field) } }
+
+    foreach ($LogicalField in @($Fields | Select-Object -Unique)) {
         if (-not $Config.FieldMappings.PSObject.Properties.Name.Contains([string]$LogicalField)) { continue }
         $Mapped = [string]$Config.FieldMappings.$LogicalField
-        if ($Mapped -like '_snipeit_*') { [pscustomobject]@{ LogicalField = [string]$LogicalField; MappedName = $Mapped } }
+        if ($Mapped.StartsWith('_snipeit_', [StringComparison]::OrdinalIgnoreCase)) {
+            [pscustomobject]@{ LogicalField = [string]$LogicalField; MappedName = $Mapped }
+        }
     }
 }
 
 function Test-SnipeItCustomFieldPreflight {
+    <#
+    .SYNOPSIS
+    Blocks Apply mode when configured custom fields are absent from fetched Snipe-IT metadata.
+    #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][object[]]$Assets)
     $Mappings = @(Get-ConfiguredCustomFieldMappings -Config $Script:Runtime.Config)
@@ -565,7 +648,8 @@ function Test-SnipeItCustomFieldPreflight {
     foreach ($Mapping in $Mappings) {
         $Found = $false
         foreach ($Asset in $Assets) {
-            if ($Asset.PSObject.Properties.Name -contains 'custom_fields' -and $Asset.custom_fields -and $Asset.custom_fields.PSObject.Properties.Name -contains $Mapping.MappedName) { $Found = $true; break }
+            if (-not ($Asset.PSObject.Properties.Name -contains 'custom_fields') -or -not $Asset.custom_fields) { continue }
+            if ($Asset.custom_fields.PSObject.Properties.Name -contains $Mapping.MappedName) { $Found = $true; break }
         }
         if (-not $Found) { throw "Configured Snipe-IT custom field mapping '$($Mapping.MappedName)' for '$($Mapping.LogicalField)' was not present in fetched asset metadata. Validate FieldMappings before Apply." }
     }
