@@ -1,11 +1,11 @@
 #requires -Version 7.2
 <#
 .SYNOPSIS
-Thin executable wrapper for the Snipe-IT Azure sync module.
+Thin executable wrapper for the hardened Snipe-IT Azure sync module.
 
 .DESCRIPTION
-Imports SnipeItAzureSync.psm1 and exits with the module-returned process exit code.
-Reusable logic lives in the module so tests can import the exact production code without modifying source text.
+Imports SnipeItAzureSync.Certified.psm1 and exits with the module-returned process exit code.
+Reusable logic lives in modules so tests can import the exact production code without modifying source text.
 #>
 
 [CmdletBinding()]
@@ -38,7 +38,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$ModulePath = Join-Path $PSScriptRoot 'SnipeItAzureSync.psm1'
+$ModulePath = Join-Path $PSScriptRoot 'SnipeItAzureSync.Certified.psm1'
 Import-Module -Name $ModulePath -Force -ErrorAction Stop
 
 $InvokeParameters = @{
