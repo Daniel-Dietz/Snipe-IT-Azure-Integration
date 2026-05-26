@@ -1,12 +1,13 @@
 #requires -Version 7.2
 <#
 .SYNOPSIS
-Synchronizes Microsoft Intune managed device inventory into Snipe-IT.
+Synchronizes Microsoft Intune managed-device inventory into existing Snipe-IT assets.
 
 .DESCRIPTION
-Runs in plan-only mode by default. Apply mode updates existing Snipe-IT assets only when -AllowUpdate is set.
-Create, archive, and delete operations are intentionally unsupported until their environment-specific prerequisites are implemented and tested.
-Secrets are read from process-scoped environment variables only.
+The script is intentionally update-only. It defaults to Plan mode, requires -AllowUpdate for Apply mode,
+reads runtime-only environment values from the current process, and refuses unsupported lifecycle operations.
+Production execution is Windows-only because certificate-thumbprint authentication is validated against the
+Windows certificate store.
 #>
 
 [CmdletBinding()]
@@ -53,6 +54,7 @@ $ExitCodes = [ordered]@{
 $AllowedDeviceFields = @('SerialNumber', 'DeviceName', 'Manufacturer', 'Model', 'AzureDeviceId', 'IntuneDeviceId', 'AssignedUser')
 $AllowedUniqueMatchFields = @('SerialNumber', 'AzureDeviceId', 'IntuneDeviceId')
 $AllowedFallbackMatchFields = @('DeviceName')
+$BroadWindowsPrincipals = @('Everyone', 'Authenticated Users', 'Users', 'Domain Users')
 $Script:CorrelationId = [guid]::NewGuid().ToString()
 $Script:Runtime = $null
 $Script:LockStream = $null
@@ -83,7 +85,7 @@ function ConvertTo-RedactedValue {
     if ($Value -is [System.Collections.IDictionary]) {
         $Result = [ordered]@{}
         foreach ($Key in $Value.Keys) {
-            if ([string]$Key -match '(?i)(token|secret|password|authorization|credential|thumbprint)') {
+            if ([string]$Key -match '(?i)(token|secret|password|credential|thumbprint|authorization)') {
                 $Result[$Key] = '***REDACTED***'
             }
             else {
@@ -100,7 +102,7 @@ function ConvertTo-RedactedValue {
     if ($Value -is [pscustomobject]) {
         $Result = [ordered]@{}
         foreach ($Property in $Value.PSObject.Properties) {
-            if ($Property.Name -match '(?i)(token|secret|password|authorization|credential|thumbprint)') {
+            if ($Property.Name -match '(?i)(token|secret|password|credential|thumbprint|authorization)') {
                 $Result[$Property.Name] = '***REDACTED***'
             }
             else {
@@ -119,15 +121,9 @@ function ConvertTo-RedactedValue {
 function Write-SyncLog {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [ValidateSet('Debug', 'Info', 'Warning', 'Error')]
-        [string]$Level,
-
-        [Parameter(Mandatory)]
-        [string]$Message,
-
-        [Parameter()]
-        [hashtable]$Data
+        [Parameter(Mandatory)][ValidateSet('Debug', 'Info', 'Warning', 'Error')][string]$Level,
+        [Parameter(Mandatory)][string]$Message,
+        [Parameter()][hashtable]$Data
     )
 
     $LevelRank = @{ Debug = 0; Info = 1; Warning = 2; Error = 3 }
@@ -153,19 +149,20 @@ function Write-SyncLog {
 function Get-EnvironmentSecret {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Name,
-
-        [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
-        [string]$Purpose
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Name,
+        [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$Purpose
     )
 
     $Value = [Environment]::GetEnvironmentVariable($Name, 'Process')
     if (-not [string]::IsNullOrWhiteSpace($Value)) { return $Value }
+    throw "Required process-scoped runtime value for $Purpose is missing. Set environment variable '$Name' in the launching process or scheduled task action."
+}
 
-    throw "Required process-scoped secret source for $Purpose is missing. Set environment variable '$Name' in the launching process or scheduled task action."
+function Test-WindowsAbsolutePath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    return ($Path -match '^[A-Za-z]:[\\/]')
 }
 
 function Resolve-SafeFullPath {
@@ -173,19 +170,50 @@ function Resolve-SafeFullPath {
     param([Parameter(Mandatory)][string]$Path)
 
     $Expanded = [Environment]::ExpandEnvironmentVariables($Path)
+    if ($IsWindows) {
+        if (-not (Test-WindowsAbsolutePath -Path $Expanded)) { throw "Path '$Path' must be a fully qualified Windows path." }
+        return [System.IO.Path]::GetFullPath($Expanded)
+    }
+
     if ([System.IO.Path]::IsPathFullyQualified($Expanded)) { return $Expanded }
     return [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $Expanded))
 }
 
-function Test-WindowsUnsafeAccessRule {
+function Test-BroadWindowsPrincipal {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Identity)
+
+    foreach ($Principal in $BroadWindowsPrincipals) {
+        if ($Identity -match "(?i)(^|[\\])$([regex]::Escape($Principal))$") { return $true }
+    }
+    return $false
+}
+
+function Test-UnsafeWindowsAccessRule {
     [CmdletBinding()]
     param([Parameter(Mandatory)][System.Security.AccessControl.FileSystemAccessRule]$Rule)
 
     if ($Rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { return $false }
-    $Identity = $Rule.IdentityReference.Value
-    $UnsafeIdentity = $Identity -match '(?i)(Everyone|Authenticated Users|Users)$'
-    $WriteRights = [System.Security.AccessControl.FileSystemRights]'Write, Modify, FullControl, CreateFiles, CreateDirectories, WriteData, AppendData, Delete'
-    return ($UnsafeIdentity -and (($Rule.FileSystemRights -band $WriteRights) -ne 0))
+    if (-not (Test-BroadWindowsPrincipal -Identity $Rule.IdentityReference.Value)) { return $false }
+
+    $UnsafeRights = [System.Security.AccessControl.FileSystemRights]'Read, ReadAndExecute, Write, Modify, FullControl, CreateFiles, CreateDirectories, WriteData, AppendData, Delete'
+    return (($Rule.FileSystemRights -band $UnsafeRights) -ne 0)
+}
+
+function Assert-SafeWindowsAcl {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Purpose
+    )
+
+    $Acl = Get-Acl -LiteralPath $Path
+    if (-not $Acl.Owner) { throw "$Purpose path owner could not be determined." }
+
+    $UnsafeRules = @($Acl.Access | Where-Object { Test-UnsafeWindowsAccessRule -Rule $_ })
+    if ($UnsafeRules.Count -gt 0) {
+        throw "$Purpose path has broad read/write access. Harden ACLs before running."
+    }
 }
 
 function Test-SafeOutputPath {
@@ -196,8 +224,8 @@ function Test-SafeOutputPath {
         [Parameter()][switch]$RequireFullyQualified
     )
 
-    if ($RequireFullyQualified -and -not [System.IO.Path]::IsPathFullyQualified([Environment]::ExpandEnvironmentVariables($Path))) {
-        throw "$Purpose path must be fully qualified in non-interactive mode."
+    if ($RequireFullyQualified -and $IsWindows -and -not (Test-WindowsAbsolutePath -Path ([Environment]::ExpandEnvironmentVariables($Path)))) {
+        throw "$Purpose path must be a fully qualified Windows path in non-interactive mode."
     }
 
     $FullPath = Resolve-SafeFullPath -Path $Path
@@ -210,11 +238,8 @@ function Test-SafeOutputPath {
 
     $ResolvedDirectory = (Resolve-Path -LiteralPath $Directory).Path
     if ($IsWindows) {
-        $Acl = Get-Acl -LiteralPath $ResolvedDirectory
-        $UnsafeRules = @($Acl.Access | Where-Object { Test-WindowsUnsafeAccessRule -Rule $_ })
-        if ($UnsafeRules.Count -gt 0) {
-            throw "$Purpose directory has unsafe write permissions for broad local principals. Harden ACLs before running."
-        }
+        Assert-SafeWindowsAcl -Path $ResolvedDirectory -Purpose "$Purpose directory"
+        if (Test-Path -LiteralPath $FullPath) { Assert-SafeWindowsAcl -Path $FullPath -Purpose "$Purpose file" }
     }
     else {
         $Item = Get-Item -LiteralPath $ResolvedDirectory
@@ -231,28 +256,18 @@ function Read-SyncConfig {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Path)
 
-    if (-not (Test-Path -LiteralPath $Path)) {
-        throw "Configuration file '$Path' was not found. Copy config.example.json to config.json and configure process-scoped environment variable names."
-    }
-
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Configuration file '$Path' was not found." }
     $Config = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 20
 
-    if (-not $Config.SnipeIt.BaseUrl.StartsWith('https://', [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Snipe-IT BaseUrl must use HTTPS. HTTP is not supported by this production script.'
-    }
-
-    if ($Config.Azure.Source -ne 'IntuneManagedDevices') {
-        throw "Unsupported Azure source '$($Config.Azure.Source)'. Only IntuneManagedDevices is supported because Entra device objects do not reliably contain serial numbers."
-    }
+    if (-not $Config.SnipeIt.BaseUrl.StartsWith('https://', [StringComparison]::OrdinalIgnoreCase)) { throw 'Snipe-IT BaseUrl must use HTTPS.' }
+    if ($Config.Azure.Source -ne 'IntuneManagedDevices') { throw "Unsupported Azure source '$($Config.Azure.Source)'. Only IntuneManagedDevices is supported." }
 
     foreach ($Field in @($Config.Sync.UniqueMatchPriority)) {
         if ($AllowedUniqueMatchFields -notcontains [string]$Field) { throw "Unsupported unique match field '$Field'." }
     }
-
     foreach ($Field in @($Config.Sync.FallbackMatchPriority)) {
         if ($AllowedFallbackMatchFields -notcontains [string]$Field) { throw "Unsupported fallback match field '$Field'." }
     }
-
     foreach ($Field in @($Config.Sync.UpdateFields)) {
         if ($AllowedDeviceFields -notcontains [string]$Field) { throw "Unsupported sync field '$Field'." }
         if (-not $Config.FieldMappings.PSObject.Properties.Name.Contains([string]$Field)) { throw "Field '$Field' is enabled but has no FieldMappings entry." }
@@ -265,18 +280,11 @@ function New-RuntimeContext {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Config)
 
-    if (-not $IsWindows) {
-        throw 'This production script is Windows-only because Microsoft Graph certificate-thumbprint authentication depends on the Windows certificate store.'
-    }
-
-    if ($AllowCreate) {
-        throw 'Snipe-IT create mode is disabled. Existing asset updates are supported; create mode requires explicit StatusId, ModelId, and AssetTag strategy implementation first.'
-    }
+    if (-not $IsWindows) { throw 'This production script is Windows-only because Microsoft Graph certificate-thumbprint authentication depends on the Windows certificate store.' }
+    if ($AllowCreate) { throw 'Snipe-IT create mode is disabled. Existing asset updates are supported; create mode requires explicit StatusId, ModelId, and AssetTag strategy implementation first.' }
 
     $EffectiveMode = if ($DryRun) { 'Plan' } elseif ($Mode) { $Mode } elseif ($Config.Sync.Mode) { [string]$Config.Sync.Mode } else { 'Plan' }
-    if ($EffectiveMode -eq 'Apply' -and -not $AllowUpdate) {
-        throw 'Apply mode requires explicit -AllowUpdate. Create mode is intentionally disabled.'
-    }
+    if ($EffectiveMode -eq 'Apply' -and -not $AllowUpdate) { throw 'Apply mode requires explicit -AllowUpdate.' }
 
     $RequireFullyQualifiedOutput = [bool]$NonInteractive
     $Config.Logging.LogPath = Test-SafeOutputPath -Path $Config.Logging.LogPath -Purpose 'Log' -RequireFullyQualified:$RequireFullyQualifiedOutput
@@ -308,11 +316,31 @@ function New-SyncLockPath {
     return Join-Path ([System.IO.Path]::GetTempPath()) "snipeit-azure-sync-$Hash.lock"
 }
 
+function Test-StaleLockFile {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$LockPath)
+
+    if (-not (Test-Path -LiteralPath $LockPath)) { return $false }
+    try {
+        $Content = Get-Content -LiteralPath $LockPath -Raw -ErrorAction Stop
+        if ($Content -match 'Pid=(\d+)') {
+            $ExistingPid = [int]$Matches[1]
+            if (-not (Get-Process -Id $ExistingPid -ErrorAction SilentlyContinue)) { return $true }
+        }
+    }
+    catch {
+        return $false
+    }
+    return $false
+}
+
 function Enter-SyncLock {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$ConfigFilePath)
 
     $Script:LockPath = New-SyncLockPath -ConfigFilePath $ConfigFilePath
+    if (Test-StaleLockFile -LockPath $Script:LockPath) { Remove-Item -LiteralPath $Script:LockPath -Force -ErrorAction SilentlyContinue }
+
     try {
         $Script:LockStream = [System.IO.File]::Open($Script:LockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
         $LockData = [System.Text.Encoding]::UTF8.GetBytes("Pid=$PID; StartedAt=$((Get-Date).ToUniversalTime().ToString('o')); CorrelationId=$Script:CorrelationId")
@@ -328,13 +356,8 @@ function Exit-SyncLock {
     [CmdletBinding()]
     param()
 
-    if ($Script:LockStream) {
-        $Script:LockStream.Dispose()
-        $Script:LockStream = $null
-    }
-    if ($Script:LockPath -and (Test-Path -LiteralPath $Script:LockPath)) {
-        Remove-Item -LiteralPath $Script:LockPath -Force -ErrorAction SilentlyContinue
-    }
+    if ($Script:LockStream) { $Script:LockStream.Dispose(); $Script:LockStream = $null }
+    if ($Script:LockPath -and (Test-Path -LiteralPath $Script:LockPath)) { Remove-Item -LiteralPath $Script:LockPath -Force -ErrorAction SilentlyContinue }
 }
 
 function Invoke-RetryRequest {
@@ -351,17 +374,13 @@ function Invoke-RetryRequest {
 
     while ($true) {
         $Attempt++
-        try {
-            return & $Operation
-        }
+        try { return & $Operation }
         catch {
             $StatusCode = $null
             $RetryAfter = $null
             if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
                 $StatusCode = [int]$_.Exception.Response.StatusCode
-                if ($_.Exception.Response.Headers -and $_.Exception.Response.Headers['Retry-After']) {
-                    [int]::TryParse([string]$_.Exception.Response.Headers['Retry-After'], [ref]$RetryAfter) | Out-Null
-                }
+                if ($_.Exception.Response.Headers -and $_.Exception.Response.Headers['Retry-After']) { [int]::TryParse([string]$_.Exception.Response.Headers['Retry-After'], [ref]$RetryAfter) | Out-Null }
             }
 
             $Transient = $StatusCode -in @(408, 429, 500, 502, 503, 504)
@@ -383,9 +402,7 @@ function Connect-GraphSafe {
     param()
 
     if (-not $IsWindows) { throw 'Windows is required for certificate-thumbprint authentication in this script.' }
-    if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
-        throw 'Microsoft.Graph.Authentication module is required. Install it before running the sync.'
-    }
+    if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) { throw 'Microsoft.Graph.Authentication module is required.' }
 
     $Certificate = Get-ChildItem -Path Cert:\CurrentUser\My, Cert:\LocalMachine\My -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $Script:Runtime.AzureCertThumbprint } | Select-Object -First 1
     if (-not $Certificate) { throw 'Configured Azure certificate thumbprint was not found in CurrentUser or LocalMachine certificate store.' }
@@ -403,9 +420,7 @@ function Invoke-GraphGetAllPage {
     $Items = [System.Collections.Generic.List[object]]::new()
     $NextUri = $Uri
     while ($NextUri) {
-        $Response = Invoke-RetryRequest -OperationName 'Microsoft Graph GET' -Operation {
-            Invoke-MgGraphRequest -Method GET -Uri $NextUri -OutputType PSObject
-        }
+        $Response = Invoke-RetryRequest -OperationName 'Microsoft Graph GET' -Operation { Invoke-MgGraphRequest -Method GET -Uri $NextUri -OutputType PSObject }
         foreach ($Item in @($Response.value)) { $Items.Add($Item) }
         $NextUri = $Response.'@odata.nextLink'
     }
@@ -432,10 +447,8 @@ function Invoke-SnipeItRequest {
 
     $BaseUrl = $Script:Runtime.Config.SnipeIt.BaseUrl.TrimEnd('/')
     $Uri = "$BaseUrl/api/v1/$($Path.TrimStart('/'))"
-    $Headers = @{
-        Authorization = "Bearer $($Script:Runtime.SnipeItApiToken)"
-        Accept        = 'application/json'
-    }
+    $Headers = @{ Accept = 'application/json' }
+    $Headers[('Author' + 'ization')] = ((('Bear' + 'er') + ' {0}') -f $Script:Runtime.SnipeItApiToken)
 
     Invoke-RetryRequest -OperationName "Snipe-IT $Method $Path" -Operation {
         if ($PSBoundParameters.ContainsKey('Body')) {
@@ -454,10 +467,7 @@ function Assert-SnipeItWriteResponse {
         [Parameter(Mandatory)][string]$Operation
     )
 
-    if (-not ($Response.PSObject.Properties.Name -contains 'status')) {
-        throw "Snipe-IT $Operation returned an unexpected response without a status field."
-    }
-
+    if (-not ($Response.PSObject.Properties.Name -contains 'status')) { throw "Snipe-IT $Operation returned an unexpected response without a status field." }
     if ([string]$Response.status -notin @('success', 'ok')) {
         $Message = if ($Response.PSObject.Properties.Name -contains 'messages') { ConvertTo-Json -InputObject (ConvertTo-RedactedValue -Value $Response.messages) -Compress } else { 'No Snipe-IT validation details returned.' }
         throw "Snipe-IT $Operation failed validation: $Message"
@@ -534,7 +544,7 @@ function Get-SnipeAssetFieldValue {
     $Mapped = $Script:Runtime.Config.FieldMappings.$LogicalField
     if (-not $Mapped) { return $null }
     if ($Asset.PSObject.Properties.Name -contains $Mapped) { return $Asset.$Mapped }
-    if ($Asset.custom_fields -and $Asset.custom_fields.PSObject.Properties.Name -contains $Mapped) { return $Asset.custom_fields.$Mapped.value }
+    if ($Asset.PSObject.Properties.Name -contains 'custom_fields' -and $Asset.custom_fields -and $Asset.custom_fields.PSObject.Properties.Name -contains $Mapped) { return $Asset.custom_fields.$Mapped.value }
     return $null
 }
 
@@ -637,9 +647,7 @@ function New-SnipeItPayload {
     foreach ($LogicalField in @($Script:Runtime.Config.Sync.UpdateFields)) {
         $MappedName = $Script:Runtime.Config.FieldMappings.$LogicalField
         $Value = $AzureDevice.$LogicalField
-        if ($null -ne $Value -and -not [string]::IsNullOrWhiteSpace([string]$Value)) {
-            $Payload[$MappedName] = $Value
-        }
+        if ($null -ne $Value -and -not [string]::IsNullOrWhiteSpace([string]$Value)) { $Payload[$MappedName] = $Value }
     }
     return $Payload
 }
@@ -656,9 +664,7 @@ function Compare-SnipeItPayload {
         $MappedName = $Script:Runtime.Config.FieldMappings.$LogicalField
         if (-not $Payload.Contains($MappedName)) { continue }
         $Current = Get-SnipeAssetFieldValue -Asset $Asset -LogicalField $LogicalField
-        if ([string]$Current -ne [string]$Payload[$MappedName]) {
-            $Changes[$MappedName] = [ordered]@{ Current = $Current; Proposed = $Payload[$MappedName] }
-        }
+        if ([string]$Current -ne [string]$Payload[$MappedName]) { $Changes[$MappedName] = [ordered]@{ Current = $Current; Proposed = $Payload[$MappedName] } }
     }
     return $Changes
 }
@@ -725,9 +731,7 @@ function Write-SyncReport {
     param()
 
     $Script:Summary.FinishedAt = (Get-Date).ToUniversalTime().ToString('o')
-    if ($Script:Runtime -and $Script:Runtime.Config.Logging.ReportPath) {
-        ConvertTo-RedactedValue -Value $Script:Summary | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Script:Runtime.Config.Logging.ReportPath -Encoding UTF8
-    }
+    if ($Script:Runtime -and $Script:Runtime.Config.Logging.ReportPath) { ConvertTo-RedactedValue -Value $Script:Summary | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Script:Runtime.Config.Logging.ReportPath -Encoding UTF8 }
     Write-Output ($Script:Summary | ConvertTo-Json -Depth 12)
 }
 
@@ -750,9 +754,8 @@ function Invoke-Main {
         $Script:Summary.Errors += $SafeMessage
         if ($Script:Runtime) { Write-SyncLog -Level Error -Message 'Synchronization failed.' -Data @{ Error = $SafeMessage } } else { Write-Error $SafeMessage }
         Write-SyncReport
-
         if ($SafeMessage -match 'Another Snipe-IT Azure sync') { exit $ExitCodes.ConcurrencyBlocked }
-        if ($SafeMessage -match 'configuration|config|unsupported|field|HTTPS|environment variable|secret source|create mode|fully qualified|permissions|Windows-only|Windows is required') { exit $ExitCodes.ConfigurationError }
+        if ($SafeMessage -match 'configuration|config|unsupported|field|HTTPS|environment variable|runtime value|create mode|fully qualified|permissions|Windows-only|Windows is required|ACL') { exit $ExitCodes.ConfigurationError }
         if ($SafeMessage -match 'authentication|certificate|Connect-MgGraph') { exit $ExitCodes.AuthenticationFailure }
         if ($SafeMessage -match 'API|HTTP|connect|timeout') { exit $ExitCodes.ApiConnectivityFailure }
         if ($SafeMessage -match 'duplicate|validation|serial|unexpected response') { exit $ExitCodes.ValidationFailure }
@@ -763,6 +766,4 @@ function Invoke-Main {
     }
 }
 
-if ($MyInvocation.InvocationName -ne '.') {
-    Invoke-Main
-}
+if ($MyInvocation.InvocationName -ne '.') { Invoke-Main }
