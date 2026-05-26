@@ -55,7 +55,7 @@ Describe 'module behavior' {
         InModuleScope SnipeItAzureSync {
             param($RuntimeConfig)
             Initialize-SyncState
-            Set-SyncOptions -ConfigPath 'C:/ProgramData/SnipeITAzureSync/config.json' -Mode Plan -LogLevel Info
+            Set-SyncOptions -ConfigPath 'C:/ProgramData/SnipeITAzureSync/config.json' -Mode Plan -LogLevel Error
             $Script:Runtime = [pscustomobject]@{
                 Config         = $RuntimeConfig
                 Mode           = 'Plan'
@@ -82,6 +82,7 @@ Describe 'module behavior' {
 
     It 'keeps log text off the success stream' {
         InModuleScope SnipeItAzureSync {
+            Set-SyncOptions -ConfigPath 'C:/ProgramData/SnipeITAzureSync/config.json' -Mode Plan -LogLevel Warning
             $Result = Write-SyncLog -Level Warning -Message 'unit warning' -Data @{ Name = 'value' }
             $Result | Should -BeNullOrEmpty
         }
