@@ -12,10 +12,12 @@
   },
   "Sync": {
     "Mode": "Plan",
-    "MatchPriority": [
+    "UniqueMatchPriority": [
       "SerialNumber",
       "AzureDeviceId",
-      "IntuneDeviceId",
+      "IntuneDeviceId"
+    ],
+    "FallbackMatchPriority": [
       "DeviceName"
     ],
     "BadSerialNumbers": [
@@ -27,15 +29,6 @@
       "Unknown"
     ],
     "UpdateFields": [
-      "DeviceName",
-      "Manufacturer",
-      "Model",
-      "AzureDeviceId",
-      "IntuneDeviceId",
-      "AssignedUser"
-    ],
-    "CreateFields": [
-      "SerialNumber",
       "DeviceName",
       "Manufacturer",
       "Model",
@@ -54,8 +47,8 @@
     "AssignedUser": "assigned_user"
   },
   "Logging": {
-    "LogPath": "logs/snipeit-azure-sync.jsonl",
-    "ReportPath": "reports/snipeit-azure-sync-report.json"
+    "LogPath": "C:/ProgramData/SnipeITAzureSync/logs/snipeit-azure-sync.jsonl",
+    "ReportPath": "C:/ProgramData/SnipeITAzureSync/reports/snipeit-azure-sync-report.json"
   },
   "Retry": {
     "MaxAttempts": 4,
