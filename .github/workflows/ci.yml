@@ -115,34 +115,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install pinned Pester
+      - name: Select Pester
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
-          Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
-          $installed = Get-Module -ListAvailable -Name Pester | Where-Object { $_.Version -eq [version]$env:PESTER_VERSION } | Select-Object -First 1
-          if (-not $installed) {
-            $lastError = $null
-            foreach ($attempt in 1..3) {
-              try {
-                Write-Output "Installing Pester $env:PESTER_VERSION, attempt $attempt of 3."
-                Install-Module -Name Pester -RequiredVersion $env:PESTER_VERSION -Repository PSGallery -Scope CurrentUser -Force -SkipPublisherCheck -AllowClobber -ErrorAction Stop
-                $lastError = $null
-                break
-              }
-              catch {
-                $lastError = $_
-                Write-Warning "Pester installation attempt $attempt failed: $($_.Exception.Message)"
-                Start-Sleep -Seconds (5 * $attempt)
-              }
-            }
-            if ($lastError) { throw $lastError }
-          }
-          Import-Module Pester -RequiredVersion $env:PESTER_VERSION -Force
+          $available = @(Get-Module -ListAvailable -Name Pester | Sort-Object Version -Descending)
+          if ($available.Count -eq 0) { throw 'No Pester module is available on the runner image.' }
+          $selected = $available | Where-Object { $_.Version.Major -eq 5 } | Select-Object -First 1
+          if (-not $selected) { throw "No Pester 5 module is available. Available versions: $($available.Version -join ', ')" }
+          Import-Module $selected.Path -Force
           $loaded = Get-Module Pester
-          if ($loaded.Version -ne [version]$env:PESTER_VERSION) { throw "Loaded Pester version $($loaded.Version), expected $env:PESTER_VERSION." }
-          Write-Output "Using Pester $($loaded.Version)."
+          if ($loaded.Version.Major -ne 5) { throw "Loaded Pester version $($loaded.Version), expected major version 5." }
+          Write-Output "Using runner-provided Pester $($loaded.Version) from $($selected.Path)."
 
       - name: Run Pester behavior tests
         shell: pwsh
