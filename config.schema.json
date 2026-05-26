@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Snipe-IT Azure Integration Configuration",
+  "type": "object",
+  "required": ["SnipeIt", "Azure", "Sync", "FieldMappings", "Logging", "Retry"],
+  "additionalProperties": false,
+  "properties": {
+    "SnipeIt": {
+      "type": "object",
+      "required": ["BaseUrl", "ApiTokenEnvironmentVariable", "PageSize", "AllowInsecureTls"],
+      "additionalProperties": false,
+      "properties": {
+        "BaseUrl": { "type": "string", "format": "uri", "pattern": "^https://" },
+        "ApiTokenEnvironmentVariable": { "type": "string", "minLength": 1 },
+        "PageSize": { "type": "integer", "minimum": 1, "maximum": 500 },
+        "AllowInsecureTls": { "type": "boolean" }
+      }
+    },
+    "Azure": {
+      "type": "object",
+      "required": ["TenantIdEnvironmentVariable", "ClientIdEnvironmentVariable", "CertificateThumbprintEnvironmentVariable", "Source"],
+      "additionalProperties": false,
+      "properties": {
+        "TenantIdEnvironmentVariable": { "type": "string", "minLength": 1 },
+        "ClientIdEnvironmentVariable": { "type": "string", "minLength": 1 },
+        "CertificateThumbprintEnvironmentVariable": { "type": "string", "minLength": 1 },
+        "Source": { "type": "string", "enum": ["EntraDevices", "IntuneManagedDevices"] }
+      }
+    },
+    "Sync": {
+      "type": "object",
+      "required": ["MissingAzureDeviceAction", "MatchPriority", "BadSerialNumbers", "FieldPolicy"],
+      "additionalProperties": false,
+      "properties": {
+        "MissingAzureDeviceAction": { "type": "string", "enum": ["Ignore", "MarkMissing", "Archive", "Delete"] },
+        "MatchPriority": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true },
+        "BadSerialNumbers": { "type": "array", "items": { "type": "string" } },
+        "FieldPolicy": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "FieldMappings": { "type": "object", "additionalProperties": { "type": "string" } },
+    "Logging": {
+      "type": "object",
+      "required": ["LogPath", "ReportPath", "JsonLog"],
+      "additionalProperties": false,
+      "properties": {
+        "LogPath": { "type": "string", "minLength": 1 },
+        "ReportPath": { "type": "string", "minLength": 1 },
+        "JsonLog": { "type": "boolean" }
+      }
+    },
+    "Retry": {
+      "type": "object",
+      "required": ["MaxAttempts", "InitialDelaySeconds", "MaxDelaySeconds"],
+      "additionalProperties": false,
+      "properties": {
+        "MaxAttempts": { "type": "integer", "minimum": 1, "maximum": 10 },
+        "InitialDelaySeconds": { "type": "integer", "minimum": 1, "maximum": 60 },
+        "MaxDelaySeconds": { "type": "integer", "minimum": 1, "maximum": 300 }
+      }
+    }
+  }
+}
