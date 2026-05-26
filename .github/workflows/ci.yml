@@ -12,6 +12,10 @@ permissions:
   contents: read
   security-events: read
 
+env:
+  PSSCRIPTANALYZER_VERSION: '1.24.0'
+  PESTER_VERSION: '5.7.1'
+
 jobs:
   validate:
     name: Validate repository hygiene
@@ -21,11 +25,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install PowerShell modules
+      - name: Install pinned PowerShell modules
         shell: pwsh
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
-          Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
+          Install-Module PSScriptAnalyzer -RequiredVersion $env:PSSCRIPTANALYZER_VERSION -Scope CurrentUser -Force
 
       - name: Parse PowerShell scripts
         shell: pwsh
@@ -108,11 +112,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Pester
+      - name: Install pinned Pester
         shell: pwsh
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
-          Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module Pester -RequiredVersion $env:PESTER_VERSION -Scope CurrentUser -Force -SkipPublisherCheck
 
       - name: Run Pester behavior tests
         shell: pwsh
