@@ -120,9 +120,11 @@ jobs:
           $ErrorActionPreference = 'Stop'
           function Assert-Condition {
             param([bool]$Condition, [string]$Message)
-            if (-not $Condition) { throw $Message }
+            Write-Output "CHECK: $Message"
+            if (-not $Condition) { throw "FAILED CHECK: $Message" }
           }
 
+          Write-Output 'Loading module and configuration.'
           $modulePath = Resolve-Path './src/SnipeItAzureSync.psm1'
           $configPath = Resolve-Path './config.example.json'
           $schemaPath = Resolve-Path './config.schema.json'
@@ -131,31 +133,40 @@ jobs:
           Get-Content -LiteralPath $schemaPath -Raw | ConvertFrom-Json | Out-Null
           Import-Module -Name $modulePath -Force
 
+          Write-Output 'Running module export checks.'
           $exported = @(Get-Command -Module SnipeItAzureSync | Select-Object -ExpandProperty Name)
           Assert-Condition ($exported.Count -eq 1 -and $exported[0] -eq 'Invoke-SnipeItAzureSync') 'Module must export only Invoke-SnipeItAzureSync.'
+
+          Write-Output 'Running configuration policy checks.'
           Assert-Condition ($config.Sync.Mode -eq 'Plan') 'Example configuration must default to Plan mode.'
           Assert-Condition (-not ($config.Sync.UniqueMatchPriority -contains 'DeviceName')) 'DeviceName must not be a unique match key.'
           Assert-Condition ($config.Sync.FallbackMatchPriority -contains 'DeviceName') 'DeviceName must remain fallback-only.'
           Assert-Condition ($config.Sync.UniqueMatchPriority -contains 'AzureDeviceId') 'AzureDeviceId must remain a unique matching key.'
           Assert-Condition ($config.Sync.UniqueMatchPriority -contains 'IntuneDeviceId') 'IntuneDeviceId must remain a unique matching key.'
 
+          Write-Output 'Running field mapping checks.'
           $enabledFields = @($config.Sync.UniqueMatchPriority) + @($config.Sync.FallbackMatchPriority) + @($config.Sync.UpdateFields)
           foreach ($field in @($enabledFields | Select-Object -Unique)) {
             Assert-Condition ($config.FieldMappings.PSObject.Properties.Name -contains $field) "Missing FieldMappings entry for $field."
             Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$config.FieldMappings.$field)) "Empty FieldMappings entry for $field."
           }
 
+          Write-Output 'Running update-only API contract checks.'
           Assert-Condition ($moduleSource -match "ValidateSet\('GET', 'PATCH'\)") 'Snipe-IT request method set must remain update-only.'
           Assert-Condition ($moduleSource -notmatch "ValidateSet\('GET', 'POST'") 'POST must not be enabled for Snipe-IT API calls.'
           Assert-Condition ($moduleSource -notmatch "ValidateSet\('GET', 'DELETE'") 'DELETE must not be enabled for Snipe-IT API calls.'
           Assert-Condition ($moduleSource -match 'Apply mode requires explicit -AllowUpdate') 'Apply mode must require explicit update permission.'
           Assert-Condition ($moduleSource -match 'if \(-not \$Script:Runtime.AllowUpdate\)') 'Runtime update permission gate is missing.'
+
+          Write-Output 'Running validation and path-safety checks.'
           Assert-Condition ($moduleSource -match 'function Assert-SyncConfigShape') 'Runtime configuration shape validation is missing.'
           Assert-Condition ($moduleSource -match 'Snipe-IT BaseUrl must use HTTPS') 'HTTPS validation is missing.'
           Assert-Condition ($moduleSource -match 'function Assert-SafeOutputParentPath') 'Safe output parent validation is missing.'
           Assert-Condition ($moduleSource.IndexOf('Assert-SafeOutputParentPath -Directory $Directory') -ge 0) 'Output parent validation call is missing.'
           Assert-Condition ($moduleSource.IndexOf('New-Item -ItemType Directory -Path $Directory') -ge 0) 'Output directory creation call is missing.'
           Assert-Condition ($moduleSource.IndexOf('Assert-SafeOutputParentPath -Directory $Directory') -lt $moduleSource.IndexOf('New-Item -ItemType Directory -Path $Directory')) 'Output parent path must be validated before directory creation.'
+
+          Write-Output 'Running serialless matching checks.'
           Assert-Condition ($moduleSource -match "if \(\$KeyName -eq 'SerialNumber' -and \(Test-BadSerialNumber") 'Serialless matching guard is missing.'
           Assert-Condition ($moduleSource -match 'AzureDeviceId') 'AzureDeviceId handling is missing.'
           Assert-Condition ($moduleSource -match 'IntuneDeviceId') 'IntuneDeviceId handling is missing.'
