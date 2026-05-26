@@ -178,7 +178,10 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $moduleSource = Get-Content -LiteralPath './src/SnipeItAzureSync.psm1' -Raw
-          if ($moduleSource -notmatch "if \(\$KeyName -eq 'SerialNumber' -and \(Test-BadSerialNumber") { throw 'Serialless matching guard is missing.' }
+          if ($moduleSource -notmatch 'function Find-SnipeItAssetMatch') { throw 'Find-SnipeItAssetMatch function is missing.' }
+          if ($moduleSource -notmatch "\$KeyName -eq 'SerialNumber'") { throw 'SerialNumber branch is missing from matching logic.' }
+          if ($moduleSource -notmatch 'Test-BadSerialNumber') { throw 'Bad serial guard is missing from matching logic.' }
+          if ($moduleSource -notmatch 'continue') { throw 'Serialless matching must continue to later match keys.' }
           foreach ($required in @('AzureDeviceId', 'IntuneDeviceId')) {
             if ($moduleSource -notmatch $required) { throw "$required handling is missing." }
           }
