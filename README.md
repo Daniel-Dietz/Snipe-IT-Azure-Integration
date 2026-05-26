@@ -18,16 +18,18 @@ The script is intentionally conservative:
 - transient API failures are retried with exponential backoff and `Retry-After` support
 - sensitive values are recursively redacted from logs and reports
 - log/report directories and existing files are validated before use
+- config, log, and report ACLs are checked against a restrictive Windows principal allow-list
 - stale sync lock files are detected and removed when the recorded process no longer exists
 
 ## Production gate
 
-Before production use, the latest commit on `main` must have a successful CI run with both jobs passing:
+Before production use, the latest commit on `main` must have a successful CI run with all required jobs passing:
 
 - `Validate repository hygiene`
 - `Run Windows behavior tests`
+- `Certification gate`
 
-Do not deploy from a commit where either job is failing or missing.
+Do not deploy from a commit where any required job is failing or missing.
 
 ## Requirements
 
@@ -51,7 +53,7 @@ Avoid broad write permissions such as `Directory.ReadWrite.All`, `Device.ReadWri
 
 Top-level Snipe-IT fields are mapped directly. Custom fields must use the Snipe-IT API field keys configured in `FieldMappings`, for example `_snipeit_azure_device_id_1`.
 
-Before enabling `Apply`, validate in `Plan` mode that proposed custom-field changes match the field keys configured in your Snipe-IT instance.
+Before enabling `Apply`, validate in `Plan` mode that proposed custom-field changes match the field keys configured in your Snipe-IT instance. In `Apply` mode with `-AllowUpdate`, the hardened module performs a preflight check and blocks execution when configured custom field metadata is absent from fetched Snipe-IT assets.
 
 ## First run
 
@@ -83,6 +85,23 @@ Only enable updates after reviewing the plan report:
 pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath C:\ProgramData\SnipeITAzureSync\config.json -Mode Apply -AllowUpdate -NonInteractive
 ```
 
+## Security configuration
+
+`Security.AllowedWindowsPrincipals` is an explicit extension allow-list for ACL validation. The script always allows `NT AUTHORITY\SYSTEM`, `BUILTIN\Administrators`, and the current process identity. Add only operationally required principals such as a dedicated scheduled-task service account, a deployment group, or a backup/monitoring principal.
+
+Example:
+
+```json
+"Security": {
+  "AllowedWindowsPrincipals": [
+    "DOMAIN\\svc-snipeit-sync",
+    "DOMAIN\\IT-Operations"
+  ]
+}
+```
+
+Do not add broad principals such as `Everyone`, `Authenticated Users`, `Users`, or `Domain Users`.
+
 ## Unsupported lifecycle actions
 
 The script does **not** create, archive, or delete Snipe-IT assets. Create mode is disabled until model/status/asset-tag prerequisites are implemented and tested. Missing-asset cleanup is also intentionally unsupported.
@@ -98,15 +117,19 @@ C:\ProgramData\SnipeITAzureSync\reports\snipeit-azure-sync-report.json
 
 Sensitive values are redacted before logging. Protect the log and report directories because they still contain operational inventory metadata such as device names and serial numbers.
 
+`Logging.EmitInformationStream` controls whether structured log lines are also emitted to the PowerShell information stream. It should normally remain `false` for scheduled tasks and automation so JSON log lines do not pollute console output. File logging remains enabled regardless of this setting.
+
 ## Repository layout
 
 ```text
-src/Sync-SnipeItAzure.ps1          Main sync script
-config.example.json                Example configuration without runtime secrets
-config.schema.json                 JSON schema for configuration validation
-docs/runbook.md                    Operational runbook
-tests/Sync-SnipeItAzure.Tests.ps1  Pester behavior tests
-.github/workflows/ci.yml           CI checks
+src/Sync-SnipeItAzure.ps1                Thin executable wrapper
+src/SnipeItAzureSync.psm1                Base sync implementation
+src/SnipeItAzureSync.Certified.psm1      Certification hardening layer
+docs/runbook.md                          Operational runbook
+tests/Sync-SnipeItAzure.Tests.ps1        Pester behavior tests
+config.example.json                      Example configuration without runtime secrets
+config.schema.json                       JSON schema for configuration validation
+.github/workflows/ci.yml                 CI checks and certification gate
 ```
 
 ## Exit codes
