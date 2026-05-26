@@ -2,27 +2,13 @@ BeforeAll {
     $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
     $ExampleConfigPath = Join-Path $RepoRoot 'config.example.json'
     $ExampleSchemaPath = Join-Path $RepoRoot 'config.schema.json'
-    $ScriptPath = Join-Path $RepoRoot 'src/Sync-SnipeItAzure.ps1'
+    $ModulePath = Join-Path $RepoRoot 'src/SnipeItAzureSync.psm1'
     $ExampleConfig = Get-Content -LiteralPath $ExampleConfigPath -Raw | ConvertFrom-Json
     $ExampleConfig.Logging.LogPath = Join-Path $TestDrive 'logs/out.jsonl'
     $ExampleConfig.Logging.ReportPath = Join-Path $TestDrive 'reports/out.json'
     New-Item -ItemType Directory -Path (Split-Path -Parent $ExampleConfig.Logging.LogPath) -Force | Out-Null
     New-Item -ItemType Directory -Path (Split-Path -Parent $ExampleConfig.Logging.ReportPath) -Force | Out-Null
-    $RuntimeScriptPath = Join-Path $TestDrive 'Sync-SnipeItAzure.Runtime.ps1'
-    $RuntimeScript = Get-Content -LiteralPath $ScriptPath -Raw
-    $RuntimeScript = $RuntimeScript -replace "(?s)if \(\$MyInvocation\.InvocationName -ne '\.'\) \{ Invoke-Main \}\s*$", ''
-    Set-Content -LiteralPath $RuntimeScriptPath -Value $RuntimeScript -Encoding UTF8
-    . $RuntimeScriptPath
-
-    function Set-TestRuntime {
-        param([object]$RuntimeConfig)
-        $Script:Runtime = [pscustomobject]@{
-            Config         = $RuntimeConfig
-            Mode           = 'Plan'
-            AllowUpdate    = $false
-            NonInteractive = $false
-        }
-    }
+    Import-Module -Name $ModulePath -Force
 
     function New-TestAsset {
         param(
@@ -64,85 +50,105 @@ Describe 'configuration and schema safety' {
     }
 }
 
-Describe 'runtime value sourcing' {
+Describe 'module behavior' {
+    BeforeEach {
+        InModuleScope SnipeItAzureSync {
+            param($RuntimeConfig)
+            Initialize-SyncState
+            Set-SyncOptions -ConfigPath 'C:/ProgramData/SnipeITAzureSync/config.json' -Mode Plan -LogLevel Info
+            $Script:Runtime = [pscustomobject]@{
+                Config         = $RuntimeConfig
+                Mode           = 'Plan'
+                AllowUpdate    = $false
+                NonInteractive = $false
+            }
+        } -ArgumentList $ExampleConfig
+    }
+
     It 'uses only process scope for runtime values' {
-        $Name = 'SYNC_TEST_VALUE'
-        [Environment]::SetEnvironmentVariable($Name, $null, 'Process')
-        try {
-            { Get-EnvironmentSecret -Name $Name -Purpose 'unit test' } | Should -Throw '*process-scoped*'
-            [Environment]::SetEnvironmentVariable($Name, 'process-value', 'Process')
-            Get-EnvironmentSecret -Name $Name -Purpose 'unit test' | Should -Be 'process-value'
-        }
-        finally {
+        InModuleScope SnipeItAzureSync {
+            $Name = 'SYNC_TEST_VALUE'
             [Environment]::SetEnvironmentVariable($Name, $null, 'Process')
+            try {
+                { Get-EnvironmentRuntimeValue -Name $Name -Purpose 'unit test' } | Should -Throw '*process-scoped*'
+                [Environment]::SetEnvironmentVariable($Name, 'process-value', 'Process')
+                Get-EnvironmentRuntimeValue -Name $Name -Purpose 'unit test' | Should -Be 'process-value'
+            }
+            finally {
+                [Environment]::SetEnvironmentVariable($Name, $null, 'Process')
+            }
         }
     }
-}
 
-Describe 'matching behavior' {
-    BeforeEach {
-        Set-TestRuntime -RuntimeConfig $ExampleConfig
+    It 'keeps log text off the success stream' {
+        InModuleScope SnipeItAzureSync {
+            $Result = Write-SyncLog -Level Warning -Message 'unit warning' -Data @{ Name = 'value' }
+            $Result | Should -BeNullOrEmpty
+        }
     }
 
     It 'normalizes serial values before duplicate detection' {
-        $DeviceA = [pscustomobject]@{ SerialNumber = 'ABC-123'; AzureDeviceId = 'az-1'; IntuneDeviceId = 'in-1'; DeviceName = 'host-a' }
-        $DeviceB = [pscustomobject]@{ SerialNumber = 'abc 123'; AzureDeviceId = 'az-2'; IntuneDeviceId = 'in-2'; DeviceName = 'host-b' }
-        { Test-AzureDuplicateKey -Devices @($DeviceA, $DeviceB) } | Should -Throw '*Duplicate Azure device value detected for SerialNumber*'
-    }
-
-    It 'does not fail on duplicate fallback names during lookup creation' {
-        $AssetA = New-TestAsset -Id 1 -Serial 'A1' -Name 'shared-name'
-        $AssetB = New-TestAsset -Id 2 -Serial 'B1' -Name 'shared-name'
-        { New-AssetLookup -Assets @($AssetA, $AssetB) } | Should -Not -Throw
+        InModuleScope SnipeItAzureSync {
+            $DeviceA = [pscustomobject]@{ SerialNumber = 'ABC-123'; AzureDeviceId = 'az-1'; IntuneDeviceId = 'in-1'; DeviceName = 'host-a' }
+            $DeviceB = [pscustomobject]@{ SerialNumber = 'abc 123'; AzureDeviceId = 'az-2'; IntuneDeviceId = 'in-2'; DeviceName = 'host-b' }
+            { Test-AzureDuplicateKey -Devices @($DeviceA, $DeviceB) } | Should -Throw '*Duplicate Azure device value detected for SerialNumber*'
+        }
     }
 
     It 'skips ambiguous fallback matches instead of guessing' {
-        $AssetA = New-TestAsset -Id 1 -Serial 'A1' -Name 'shared-name'
-        $AssetB = New-TestAsset -Id 2 -Serial 'B1' -Name 'shared-name'
-        $Lookup = New-AssetLookup -Assets @($AssetA, $AssetB)
-        $Device = [pscustomobject]@{ SerialNumber = $null; AzureDeviceId = $null; IntuneDeviceId = $null; DeviceName = 'shared-name' }
-        $Result = @(Find-SnipeItAssetMatch -AzureDevice $Device -AssetLookup $Lookup | Where-Object { $_ -isnot [string] })
-        $Result | Should -BeNullOrEmpty
-    }
-}
-
-Describe 'payload behavior' {
-    BeforeEach {
-        Set-TestRuntime -RuntimeConfig $ExampleConfig
+        InModuleScope SnipeItAzureSync {
+            param($AssetA, $AssetB)
+            $Lookup = New-AssetLookup -Assets @($AssetA, $AssetB)
+            $Device = [pscustomobject]@{ SerialNumber = $null; AzureDeviceId = $null; IntuneDeviceId = $null; DeviceName = 'shared-name' }
+            Find-SnipeItAssetMatch -AzureDevice $Device -AssetLookup $Lookup | Should -BeNullOrEmpty
+        } -ArgumentList (New-TestAsset -Id 1 -Serial 'A1' -Name 'shared-name'), (New-TestAsset -Id 2 -Serial 'B1' -Name 'shared-name')
     }
 
-    It 'reads custom mapped field values without failing when custom fields are present' {
-        $Asset = New-TestAsset -Id 10 -Serial 'S1' -Name 'HOST01' -AzureId 'az-1'
-        Get-SnipeAssetFieldValue -Asset $Asset -LogicalField 'AzureDeviceId' | Should -Be 'az-1'
-    }
-
-    It 'does not fail when optional custom fields are missing' {
-        $Asset = [pscustomobject]@{ id = 11; serial = 'S2'; name = 'HOST02' }
-        { Get-SnipeAssetFieldValue -Asset $Asset -LogicalField 'AzureDeviceId' } | Should -Not -Throw
-        Get-SnipeAssetFieldValue -Asset $Asset -LogicalField 'AzureDeviceId' | Should -BeNullOrEmpty
+    It 'reads custom mapped field values safely' {
+        InModuleScope SnipeItAzureSync {
+            param($Asset)
+            Get-SnipeAssetFieldValue -Asset $Asset -LogicalField 'AzureDeviceId' | Should -Be 'az-1'
+            $AssetWithoutCustom = [pscustomobject]@{ id = 11; serial = 'S2'; name = 'HOST02' }
+            { Get-SnipeAssetFieldValue -Asset $AssetWithoutCustom -LogicalField 'AzureDeviceId' } | Should -Not -Throw
+        } -ArgumentList (New-TestAsset -Id 10 -Serial 'S1' -Name 'HOST01' -AzureId 'az-1')
     }
 
     It 'compares custom field values through logical mappings' {
-        $Asset = New-TestAsset -Id 12 -Serial 'S3' -Name 'HOST03' -AzureId 'az-3'
-        $Payload = @{ name = 'HOST03'; _snipeit_azure_device_id_1 = 'az-3' }
-        $Changes = Compare-SnipeItPayload -Asset $Asset -Payload $Payload
-        $Changes.Count | Should -Be 0
+        InModuleScope SnipeItAzureSync {
+            param($Asset)
+            $Payload = @{ name = 'HOST03'; _snipeit_azure_device_id_1 = 'az-3' }
+            $Changes = Compare-SnipeItPayload -Asset $Asset -Payload $Payload
+            $Changes.Count | Should -Be 0
+        } -ArgumentList (New-TestAsset -Id 12 -Serial 'S3' -Name 'HOST03' -AzureId 'az-3')
     }
 
     It 'rejects malformed write responses without status' {
-        { Assert-SnipeItWriteResponse -Response ([pscustomobject]@{ payload = 'unexpected' }) -Operation 'update asset' } | Should -Throw '*without a status field*'
+        InModuleScope SnipeItAzureSync {
+            { Assert-SnipeItWriteResponse -Response ([pscustomobject]@{ payload = 'unexpected' }) -Operation 'update asset' } | Should -Throw '*without a status field*'
+        }
     }
-}
 
-Describe 'path and lock behavior' {
     It 'recognizes Windows absolute paths independently of runner OS' {
-        Test-WindowsAbsolutePath -Path 'C:/ProgramData/SnipeITAzureSync/logs/file.jsonl' | Should -BeTrue
-        Test-WindowsAbsolutePath -Path './relative/file.jsonl' | Should -BeFalse
+        InModuleScope SnipeItAzureSync {
+            Test-WindowsAbsolutePath -Path 'C:/ProgramData/SnipeITAzureSync/logs/file.jsonl' | Should -BeTrue
+            Test-WindowsAbsolutePath -Path './relative/file.jsonl' | Should -BeFalse
+        }
     }
 
     It 'removes stale locks when recorded process no longer exists' {
-        $LockPath = Join-Path $TestDrive 'sync.lock'
-        'Pid=99999999; StartedAt=2000-01-01T00:00:00Z' | Set-Content -LiteralPath $LockPath
-        Test-StaleLockFile -LockPath $LockPath | Should -BeTrue
+        InModuleScope SnipeItAzureSync {
+            param($LockPath)
+            'Pid=99999999; StartedAt=2000-01-01T00:00:00Z' | Set-Content -LiteralPath $LockPath
+            Test-StaleLockFile -LockPath $LockPath | Should -BeTrue
+        } -ArgumentList (Join-Path $TestDrive 'sync.lock')
+    }
+
+    It 'validates configured custom fields before Apply updates' {
+        InModuleScope SnipeItAzureSync {
+            param($Asset)
+            { Test-SnipeItCustomFieldPreflight -Assets @($Asset) } | Should -Not -Throw
+            $BadAsset = [pscustomobject]@{ id = 99; serial = 'S9'; name = 'HOST99'; custom_fields = [pscustomobject]@{} }
+            { Test-SnipeItCustomFieldPreflight -Assets @($BadAsset) } | Should -Throw '*custom field mapping*'
+        } -ArgumentList (New-TestAsset -Id 10 -Serial 'S1' -Name 'HOST01' -AzureId 'az-1' -IntuneId 'in-1')
     }
 }
