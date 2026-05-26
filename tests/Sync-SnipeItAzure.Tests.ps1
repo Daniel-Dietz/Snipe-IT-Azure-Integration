@@ -3,9 +3,11 @@ BeforeAll {
     $ExampleConfigPath = Join-Path $RepoRoot 'config.example.json'
     $ExampleSchemaPath = Join-Path $RepoRoot 'config.schema.json'
     $ModulePath = Join-Path $RepoRoot 'src/SnipeItAzureSync.psm1'
+    $TestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('SnipeItAzureSync.Tests.' + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $TestRoot -Force | Out-Null
     $ExampleConfig = Get-Content -LiteralPath $ExampleConfigPath -Raw | ConvertFrom-Json
-    $ExampleConfig.Logging.LogPath = Join-Path $TestDrive 'logs/out.jsonl'
-    $ExampleConfig.Logging.ReportPath = Join-Path $TestDrive 'reports/out.json'
+    $ExampleConfig.Logging.LogPath = Join-Path $TestRoot 'logs/out.jsonl'
+    $ExampleConfig.Logging.ReportPath = Join-Path $TestRoot 'reports/out.json'
     New-Item -ItemType Directory -Path (Split-Path -Parent $ExampleConfig.Logging.LogPath) -Force | Out-Null
     New-Item -ItemType Directory -Path (Split-Path -Parent $ExampleConfig.Logging.ReportPath) -Force | Out-Null
     Import-Module -Name $ModulePath -Force
@@ -61,6 +63,12 @@ BeforeAll {
     function Copy-TestConfig {
         param([object]$Config = $ExampleConfig)
         return ($Config | ConvertTo-Json -Depth 20 | ConvertFrom-Json)
+    }
+}
+
+AfterAll {
+    if ($TestRoot -and (Test-Path -LiteralPath $TestRoot)) {
+        Remove-Item -LiteralPath $TestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -194,7 +202,7 @@ Describe 'module behavior' {
 
             $Match.MatchKey | Should -Be 'SerialNumber'
             $Changes.Count | Should -BeGreaterThan 0
-            $Changes.name.Proposed | Should -Be 'HOST200'
+            $Changes['name'].Proposed | Should -Be 'HOST200'
         } -ArgumentList (New-TestAsset -Id 200 -Serial 'SERIAL200' -Name 'OLD200' -AzureId 'azure-200' -IntuneId 'intune-200'), (New-TestAzureDevice -Id 'intune-200' -AzureId 'azure-200' -Name 'HOST200' -Serial 'SERIAL200')
     }
 
@@ -209,7 +217,7 @@ Describe 'module behavior' {
 
             $Match.MatchKey | Should -Be 'AzureDeviceId'
             $Changes.Count | Should -BeGreaterThan 0
-            $Payload.name | Should -Be 'SERIALLESS300'
+            $Payload['name'] | Should -Be 'SERIALLESS300'
         } -ArgumentList (New-TestAsset -Id 300 -Serial '' -Name 'OLD300' -AzureId 'azure-300' -IntuneId 'intune-300'), (New-TestAzureDevice -Id 'intune-300' -AzureId 'azure-300' -Name 'SERIALLESS300' -Serial 'To Be Filled By O.E.M.')
     }
 
@@ -231,7 +239,7 @@ Describe 'module behavior' {
             param($LockPath)
             'Pid=99999999; StartedAt=2000-01-01T00:00:00Z' | Set-Content -LiteralPath $LockPath
             Test-StaleLockFile -LockPath $LockPath | Should -BeTrue
-        } -ArgumentList (Join-Path $TestDrive 'sync.lock')
+        } -ArgumentList (Join-Path $TestRoot 'sync.lock')
     }
 
     It 'accepts configured custom field metadata before Apply updates' {
