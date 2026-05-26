@@ -27,25 +27,26 @@ $env:AZURE_CERT_THUMBPRINT = '<certificate-thumbprint>'
 ## First deployment
 
 1. Register an Entra application.
-2. Assign only the required read-only Graph application permissions.
+2. Assign only `DeviceManagementManagedDevices.Read.All` as an application permission unless the script is deliberately extended.
 3. Upload or bind a certificate to the app registration.
-4. Create a Snipe-IT API token with the minimum required scope.
-5. Copy `config.example.json` to `config.json`.
-6. Configure Snipe-IT URL and field mappings.
-7. Run a dry-run.
-8. Review the JSONL log and JSON report.
-9. Enable create/update only after validation.
+4. Install the private certificate on the sync host.
+5. Create a Snipe-IT API token with the minimum required asset scope.
+6. Copy `config.example.json` to `config.json`.
+7. Configure Snipe-IT URL and field mappings.
+8. Run `Plan` mode.
+9. Review the JSONL log and JSON report.
+10. Enable create/update only after validation.
 
-## Dry-run command
+## Plan command
 
 ```powershell
-pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath .\config.json -DryRun -LogLevel Info
+pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath .\config.json -Mode Plan -LogLevel Info
 ```
 
 ## Production command
 
 ```powershell
-pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath .\config.json -AllowCreate -AllowUpdate -NonInteractive
+pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath .\config.json -Mode Apply -AllowCreate -AllowUpdate -NonInteractive
 ```
 
 ## Emergency disable
@@ -60,7 +61,7 @@ Disable-ScheduledTask -TaskName 'Snipe-IT Azure Integration'
 
 1. Create a new Snipe-IT token.
 2. Update the protected runtime secret source.
-3. Run dry-run.
+3. Run `Plan` mode.
 4. Revoke the old token.
 5. Confirm the next scheduled run succeeds.
 
@@ -70,7 +71,7 @@ Disable-ScheduledTask -TaskName 'Snipe-IT Azure Integration'
 2. Upload the public certificate to the Entra app registration.
 3. Install the private certificate on the sync host.
 4. Update `AZURE_CERT_THUMBPRINT`.
-5. Run dry-run.
+5. Run `Plan` mode.
 6. Remove the old certificate after successful validation.
 
 ## Rollback after bad update
@@ -80,13 +81,13 @@ Disable-ScheduledTask -TaskName 'Snipe-IT Azure Integration'
 3. Identify changed assets from the latest report and Snipe-IT audit log.
 4. Revert incorrect fields manually or via a controlled restore script.
 5. Correct field mappings or sync policy.
-6. Run dry-run until the report is clean.
+6. Run `Plan` mode until the report is clean.
 7. Re-enable the scheduled task.
 
 ## Scheduled task example
 
 ```powershell
-$Action = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\Scripts\Snipe-IT-Azure-Integration\src\Sync-SnipeItAzure.ps1 -ConfigPath C:\Scripts\Snipe-IT-Azure-Integration\config.json -AllowCreate -AllowUpdate -NonInteractive'
+$Action = New-ScheduledTaskAction -Execute 'pwsh.exe' -Argument '-NoProfile -ExecutionPolicy Bypass -File C:\Scripts\Snipe-IT-Azure-Integration\src\Sync-SnipeItAzure.ps1 -ConfigPath C:\Scripts\Snipe-IT-Azure-Integration\config.json -Mode Apply -AllowCreate -AllowUpdate -NonInteractive'
 $Trigger = New-ScheduledTaskTrigger -Daily -At 02:00
 $Principal = New-ScheduledTaskPrincipal -UserId 'DOMAIN\svc-snipeit-sync' -LogonType Password -RunLevel LeastPrivilege
 Register-ScheduledTask -TaskName 'Snipe-IT Azure Integration' -Action $Action -Trigger $Trigger -Principal $Principal
@@ -101,6 +102,12 @@ Monitor these outputs:
 - warnings/errors in `logs/snipeit-azure-sync.jsonl`
 - Snipe-IT audit log
 
+Protect logs and reports because they contain operational inventory metadata even after secret redaction.
+
+## Unsupported lifecycle actions
+
+The script does not archive or delete Snipe-IT assets that are missing from Intune. Do not assume stale asset cleanup is automated.
+
 ## Exit codes
 
 | Code | Meaning | Action |
@@ -112,4 +119,3 @@ Monitor these outputs:
 | 4 | API connectivity failure | Check network, TLS, proxy, API availability |
 | 5 | Validation failure | Resolve duplicate or invalid data |
 | 6 | Partial sync failure | Review failed device entries |
-| 7 | Destructive action blocked | Confirm whether destructive behavior was intended |
