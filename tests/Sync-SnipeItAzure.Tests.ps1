@@ -8,6 +8,8 @@ BeforeAll {
         $Config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
         $Config.Logging.LogPath = Join-Path $TestDrive 'logs/snipeit-azure-sync.jsonl'
         $Config.Logging.ReportPath = Join-Path $TestDrive 'reports/snipeit-azure-sync-report.json'
+        New-Item -ItemType Directory -Path (Split-Path -Parent $Config.Logging.LogPath) -Force | Out-Null
+        New-Item -ItemType Directory -Path (Split-Path -Parent $Config.Logging.ReportPath) -Force | Out-Null
         return $Config
     }
 
