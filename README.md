@@ -53,7 +53,7 @@ Avoid broad write permissions such as `Directory.ReadWrite.All`, `Device.ReadWri
 
 Top-level Snipe-IT fields are mapped directly. Custom fields must use the Snipe-IT API field keys configured in `FieldMappings`, for example `_snipeit_azure_device_id_1`.
 
-Before enabling `Apply`, validate in `Plan` mode that proposed custom-field changes match the field keys configured in your Snipe-IT instance. In `Apply` mode with `-AllowUpdate`, the hardened module performs a preflight check and blocks execution when configured custom field metadata is absent from fetched Snipe-IT assets.
+Before enabling `Apply`, validate in `Plan` mode that proposed custom-field changes match the field keys configured in your Snipe-IT instance. In `Apply` mode with `-AllowUpdate`, the module performs a preflight check and blocks execution when configured custom field metadata is absent from fetched Snipe-IT assets.
 
 ## First run
 
@@ -122,14 +122,13 @@ Sensitive values are redacted before logging. Protect the log and report directo
 ## Repository layout
 
 ```text
-src/Sync-SnipeItAzure.ps1                Thin executable wrapper
-src/SnipeItAzureSync.psm1                Base sync implementation
-src/SnipeItAzureSync.Certified.psm1      Certification hardening layer
-docs/runbook.md                          Operational runbook
-tests/Sync-SnipeItAzure.Tests.ps1        Pester behavior tests
-config.example.json                      Example configuration without runtime secrets
-config.schema.json                       JSON schema for configuration validation
-.github/workflows/ci.yml                 CI checks and certification gate
+src/Sync-SnipeItAzure.ps1          Thin executable wrapper
+src/SnipeItAzureSync.psm1          Consolidated production sync module
+docs/runbook.md                    Operational runbook
+tests/Sync-SnipeItAzure.Tests.ps1  Pester behavior tests
+config.example.json                Example configuration without runtime secrets
+config.schema.json                 JSON schema for configuration validation
+.github/workflows/ci.yml           CI checks and certification gate
 ```
 
 ## Exit codes
@@ -148,5 +147,5 @@ config.schema.json                       JSON schema for configuration validatio
 ## Commit message
 
 ```text
-Harden Snipe-IT Azure sync runtime
+Consolidate Snipe-IT Azure sync hardening
 ```
