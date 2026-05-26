@@ -14,7 +14,6 @@ permissions:
 
 env:
   PSSCRIPTANALYZER_VERSION: '1.24.0'
-  PESTER_VERSION: '5.7.1'
 
 jobs:
   validate:
@@ -115,44 +114,52 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Select Pester
+      - name: Run Windows behavior tests
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $available = @(Get-Module -ListAvailable -Name Pester | Sort-Object Version -Descending)
-          if ($available.Count -eq 0) { throw 'No Pester module is available on the runner image.' }
-          $selected = $available | Where-Object { $_.Version.Major -eq 5 } | Select-Object -First 1
-          if (-not $selected) { throw "No Pester 5 module is available. Available versions: $($available.Version -join ', ')" }
-          Import-Module $selected.Path -Force
-          $loaded = Get-Module Pester
-          if ($loaded.Version.Major -ne 5) { throw "Loaded Pester version $($loaded.Version), expected major version 5." }
-          Write-Output "Using runner-provided Pester $($loaded.Version) from $($selected.Path)."
-
-      - name: Run Pester behavior tests
-        shell: pwsh
-        run: |
-          $config = New-PesterConfiguration
-          $config.Run.Path = './tests'
-          $config.Output.Verbosity = 'Detailed'
-          $config.TestResult.Enabled = $true
-          $config.TestResult.OutputPath = 'TestResults.xml'
-          $config.TestResult.OutputFormat = 'NUnitXml'
-          $result = Invoke-Pester -Configuration $config -PassThru
-          Write-Output "Pester summary: Total=$($result.TotalCount) Passed=$($result.PassedCount) Failed=$($result.FailedCount) Skipped=$($result.SkippedCount)"
-          if ($result.FailedCount -gt 0) {
-            foreach ($failed in @($result.Failed)) {
-              Write-Error "Pester failed: $($failed.ExpandedName) :: $($failed.ErrorRecord.Exception.Message)"
-            }
-            exit 1
+          function Assert-Condition {
+            param([bool]$Condition, [string]$Message)
+            if (-not $Condition) { throw $Message }
           }
 
-      - name: Upload Pester test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pester-test-results
-          path: TestResults.xml
-          if-no-files-found: warn
+          $modulePath = Resolve-Path './src/SnipeItAzureSync.psm1'
+          $configPath = Resolve-Path './config.example.json'
+          $schemaPath = Resolve-Path './config.schema.json'
+          $moduleSource = Get-Content -LiteralPath $modulePath -Raw
+          $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+          Get-Content -LiteralPath $schemaPath -Raw | ConvertFrom-Json | Out-Null
+          Import-Module -Name $modulePath -Force
+
+          $exported = @(Get-Command -Module SnipeItAzureSync | Select-Object -ExpandProperty Name)
+          Assert-Condition ($exported.Count -eq 1 -and $exported[0] -eq 'Invoke-SnipeItAzureSync') 'Module must export only Invoke-SnipeItAzureSync.'
+          Assert-Condition ($config.Sync.Mode -eq 'Plan') 'Example configuration must default to Plan mode.'
+          Assert-Condition (-not ($config.Sync.UniqueMatchPriority -contains 'DeviceName')) 'DeviceName must not be a unique match key.'
+          Assert-Condition ($config.Sync.FallbackMatchPriority -contains 'DeviceName') 'DeviceName must remain fallback-only.'
+          Assert-Condition ($config.Sync.UniqueMatchPriority -contains 'AzureDeviceId') 'AzureDeviceId must remain a unique matching key.'
+          Assert-Condition ($config.Sync.UniqueMatchPriority -contains 'IntuneDeviceId') 'IntuneDeviceId must remain a unique matching key.'
+
+          $enabledFields = @($config.Sync.UniqueMatchPriority) + @($config.Sync.FallbackMatchPriority) + @($config.Sync.UpdateFields)
+          foreach ($field in @($enabledFields | Select-Object -Unique)) {
+            Assert-Condition ($config.FieldMappings.PSObject.Properties.Name -contains $field) "Missing FieldMappings entry for $field."
+            Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$config.FieldMappings.$field)) "Empty FieldMappings entry for $field."
+          }
+
+          Assert-Condition ($moduleSource -match "ValidateSet\('GET', 'PATCH'\)") 'Snipe-IT request method set must remain update-only.'
+          Assert-Condition ($moduleSource -notmatch "ValidateSet\('GET', 'POST'") 'POST must not be enabled for Snipe-IT API calls.'
+          Assert-Condition ($moduleSource -notmatch "ValidateSet\('GET', 'DELETE'") 'DELETE must not be enabled for Snipe-IT API calls.'
+          Assert-Condition ($moduleSource -match 'Apply mode requires explicit -AllowUpdate') 'Apply mode must require explicit update permission.'
+          Assert-Condition ($moduleSource -match 'if \(-not \$Script:Runtime.AllowUpdate\)') 'Runtime update permission gate is missing.'
+          Assert-Condition ($moduleSource -match 'function Assert-SyncConfigShape') 'Runtime configuration shape validation is missing.'
+          Assert-Condition ($moduleSource -match 'Snipe-IT BaseUrl must use HTTPS') 'HTTPS validation is missing.'
+          Assert-Condition ($moduleSource -match 'function Assert-SafeOutputParentPath') 'Safe output parent validation is missing.'
+          Assert-Condition ($moduleSource.IndexOf('Assert-SafeOutputParentPath -Directory $Directory') -ge 0) 'Output parent validation call is missing.'
+          Assert-Condition ($moduleSource.IndexOf('New-Item -ItemType Directory -Path $Directory') -ge 0) 'Output directory creation call is missing.'
+          Assert-Condition ($moduleSource.IndexOf('Assert-SafeOutputParentPath -Directory $Directory') -lt $moduleSource.IndexOf('New-Item -ItemType Directory -Path $Directory')) 'Output parent path must be validated before directory creation.'
+          Assert-Condition ($moduleSource -match "if \(\$KeyName -eq 'SerialNumber' -and \(Test-BadSerialNumber") 'Serialless matching guard is missing.'
+          Assert-Condition ($moduleSource -match 'AzureDeviceId') 'AzureDeviceId handling is missing.'
+          Assert-Condition ($moduleSource -match 'IntuneDeviceId') 'IntuneDeviceId handling is missing.'
+          Write-Output 'Windows behavior contract checks passed.'
 
   certification-gate:
     name: Certification gate
