@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   validate:
-    name: Validate PowerShell and repository hygiene
+    name: Validate repository hygiene
     runs-on: ubuntu-latest
 
     steps:
@@ -26,7 +26,6 @@ jobs:
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           Install-Module PSScriptAnalyzer -Scope CurrentUser -Force
-          Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck
 
       - name: Parse PowerShell scripts
         shell: pwsh
@@ -61,11 +60,6 @@ jobs:
           $results | Format-Table -AutoSize
           if (@($results).Count -gt 0) { exit 1 }
 
-      - name: Run Pester tests
-        shell: pwsh
-        run: |
-          Invoke-Pester -Path ./tests -CI
-
       - name: Validate JSON files and configuration schema
         shell: pwsh
         run: |
@@ -91,7 +85,7 @@ jobs:
             'password\s*[=:]\s*[''\"][^''\"]+',
             'api[_-]?key\s*[=:]\s*[''\"][^''\"]+'
           )
-          $files = Get-ChildItem -Path . -Recurse -File | Where-Object { $_.FullName -notmatch '\\.git' }
+          $files = Get-ChildItem -Path . -Recurse -File | Where-Object { $_.FullName -notmatch '\.git' }
           $findings = @()
           foreach ($file in $files) {
             $content = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
@@ -105,3 +99,22 @@ jobs:
             $findings | ForEach-Object { Write-Error $_ }
             exit 1
           }
+
+  pester-windows:
+    name: Run Windows behavior tests
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Pester
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run Pester behavior tests
+        shell: pwsh
+        run: |
+          Invoke-Pester -Path ./tests -CI
