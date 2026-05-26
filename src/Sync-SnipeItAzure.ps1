@@ -633,7 +633,7 @@ function New-SnipeItPayload {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$AzureDevice)
 
-    $Payload = [ordered]@{}
+    $Payload = @{}
     foreach ($LogicalField in @($Script:Runtime.Config.Sync.UpdateFields)) {
         $MappedName = $Script:Runtime.Config.FieldMappings.$LogicalField
         $Value = $AzureDevice.$LogicalField
@@ -648,7 +648,7 @@ function Compare-SnipeItPayload {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Asset,
-        [Parameter(Mandatory)][hashtable]$Payload
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Payload
     )
 
     $Changes = [ordered]@{}
