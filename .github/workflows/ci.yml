@@ -118,3 +118,26 @@ jobs:
         shell: pwsh
         run: |
           Invoke-Pester -Path ./tests -CI
+
+  certification-gate:
+    name: Certification gate
+    runs-on: ubuntu-latest
+    needs:
+      - validate
+      - pester-windows
+    if: always()
+
+    steps:
+      - name: Require all production gates to pass
+        shell: pwsh
+        run: |
+          $required = @{
+            'Validate repository hygiene' = '${{ needs.validate.result }}'
+            'Run Windows behavior tests' = '${{ needs.pester-windows.result }}'
+          }
+          $failed = @($required.GetEnumerator() | Where-Object { $_.Value -ne 'success' })
+          if ($failed.Count -gt 0) {
+            $failed | ForEach-Object { Write-Error "$($_.Key) result was '$($_.Value)'" }
+            exit 1
+          }
+          Write-Output 'All production certification gates passed.'
