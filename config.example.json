@@ -48,7 +48,11 @@
   },
   "Logging": {
     "LogPath": "C:/ProgramData/SnipeITAzureSync/logs/snipeit-azure-sync.jsonl",
-    "ReportPath": "C:/ProgramData/SnipeITAzureSync/reports/snipeit-azure-sync-report.json"
+    "ReportPath": "C:/ProgramData/SnipeITAzureSync/reports/snipeit-azure-sync-report.json",
+    "EmitInformationStream": false
+  },
+  "Security": {
+    "AllowedWindowsPrincipals": []
   },
   "Retry": {
     "MaxAttempts": 4,
