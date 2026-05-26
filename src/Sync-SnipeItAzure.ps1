@@ -1,11 +1,12 @@
 #requires -Version 7.2
-<#!
+<#
 .SYNOPSIS
 Synchronizes Microsoft Intune managed device inventory into Snipe-IT.
 
 .DESCRIPTION
-Runs in plan-only mode by default. Apply mode requires explicit create/update switches. Secrets are read
-through a single sanitized runtime configuration path and are never accepted from the JSON configuration file.
+Runs in plan-only mode by default. Apply mode updates existing Snipe-IT assets only when -AllowUpdate is set.
+Create, archive, and delete operations are intentionally unsupported until their environment-specific prerequisites are implemented and tested.
+Secrets are read from process-scoped environment variables only.
 #>
 
 [CmdletBinding()]
@@ -46,12 +47,16 @@ $ExitCodes = [ordered]@{
     ApiConnectivityFailure = 4
     ValidationFailure      = 5
     PartialSyncFailure     = 6
+    ConcurrencyBlocked     = 8
 }
 
 $AllowedDeviceFields = @('SerialNumber', 'DeviceName', 'Manufacturer', 'Model', 'AzureDeviceId', 'IntuneDeviceId', 'AssignedUser')
-$AllowedMatchFields = @('SerialNumber', 'AzureDeviceId', 'IntuneDeviceId', 'DeviceName')
+$AllowedUniqueMatchFields = @('SerialNumber', 'AzureDeviceId', 'IntuneDeviceId')
+$AllowedFallbackMatchFields = @('DeviceName')
 $Script:CorrelationId = [guid]::NewGuid().ToString()
 $Script:Runtime = $null
+$Script:LockStream = $null
+$Script:LockPath = $null
 $Script:Summary = [ordered]@{
     CorrelationId     = $Script:CorrelationId
     StartedAt         = (Get-Date).ToUniversalTime().ToString('o')
@@ -141,10 +146,6 @@ function Write-SyncLog {
     Write-Output $Line
 
     if ($Script:Runtime -and $Script:Runtime.Config.Logging.LogPath) {
-        $LogDirectory = Split-Path -Parent $Script:Runtime.Config.Logging.LogPath
-        if ($LogDirectory -and -not (Test-Path -LiteralPath $LogDirectory)) {
-            New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
-        }
         Add-Content -LiteralPath $Script:Runtime.Config.Logging.LogPath -Value $Line -Encoding UTF8
     }
 }
@@ -161,12 +162,69 @@ function Get-EnvironmentSecret {
         [string]$Purpose
     )
 
-    foreach ($Scope in 'Process', 'User', 'Machine') {
-        $Value = [Environment]::GetEnvironmentVariable($Name, $Scope)
-        if (-not [string]::IsNullOrWhiteSpace($Value)) { return $Value }
+    $Value = [Environment]::GetEnvironmentVariable($Name, 'Process')
+    if (-not [string]::IsNullOrWhiteSpace($Value)) { return $Value }
+
+    throw "Required process-scoped secret source for $Purpose is missing. Set environment variable '$Name' in the launching process or scheduled task action."
+}
+
+function Resolve-SafeFullPath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+
+    $Expanded = [Environment]::ExpandEnvironmentVariables($Path)
+    if ([System.IO.Path]::IsPathFullyQualified($Expanded)) { return $Expanded }
+    return [System.IO.Path]::GetFullPath((Join-Path (Get-Location) $Expanded))
+}
+
+function Test-WindowsUnsafeAccessRule {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][System.Security.AccessControl.FileSystemAccessRule]$Rule)
+
+    if ($Rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { return $false }
+    $Identity = $Rule.IdentityReference.Value
+    $UnsafeIdentity = $Identity -match '(?i)(Everyone|Authenticated Users|Users)$'
+    $WriteRights = [System.Security.AccessControl.FileSystemRights]'Write, Modify, FullControl, CreateFiles, CreateDirectories, WriteData, AppendData, Delete'
+    return ($UnsafeIdentity -and (($Rule.FileSystemRights -band $WriteRights) -ne 0))
+}
+
+function Test-SafeOutputPath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Purpose,
+        [Parameter()][switch]$RequireFullyQualified
+    )
+
+    if ($RequireFullyQualified -and -not [System.IO.Path]::IsPathFullyQualified([Environment]::ExpandEnvironmentVariables($Path))) {
+        throw "$Purpose path must be fully qualified in non-interactive mode."
     }
 
-    throw "Required secret source for $Purpose is missing. Set environment variable '$Name' in the runtime context."
+    $FullPath = Resolve-SafeFullPath -Path $Path
+    $Directory = Split-Path -Parent $FullPath
+    if ([string]::IsNullOrWhiteSpace($Directory)) { throw "$Purpose path must include a directory." }
+
+    if (-not (Test-Path -LiteralPath $Directory)) {
+        New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+    }
+
+    $ResolvedDirectory = (Resolve-Path -LiteralPath $Directory).Path
+    if ($IsWindows) {
+        $Acl = Get-Acl -LiteralPath $ResolvedDirectory
+        $UnsafeRules = @($Acl.Access | Where-Object { Test-WindowsUnsafeAccessRule -Rule $_ })
+        if ($UnsafeRules.Count -gt 0) {
+            throw "$Purpose directory has unsafe write permissions for broad local principals. Harden ACLs before running."
+        }
+    }
+    else {
+        $Item = Get-Item -LiteralPath $ResolvedDirectory
+        $Mode = $Item.UnixFileMode
+        if (($Mode -band [System.IO.UnixFileMode]::GroupWrite) -or ($Mode -band [System.IO.UnixFileMode]::OtherWrite)) {
+            throw "$Purpose directory is group/world writable. Harden permissions before running."
+        }
+    }
+
+    return $FullPath
 }
 
 function Read-SyncConfig {
@@ -174,7 +232,7 @@ function Read-SyncConfig {
     param([Parameter(Mandatory)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        throw "Configuration file '$Path' was not found. Copy config.example.json to config.json and configure environment variable names."
+        throw "Configuration file '$Path' was not found. Copy config.example.json to config.json and configure process-scoped environment variable names."
     }
 
     $Config = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 20
@@ -187,11 +245,15 @@ function Read-SyncConfig {
         throw "Unsupported Azure source '$($Config.Azure.Source)'. Only IntuneManagedDevices is supported because Entra device objects do not reliably contain serial numbers."
     }
 
-    foreach ($Field in @($Config.Sync.MatchPriority)) {
-        if ($AllowedMatchFields -notcontains [string]$Field) { throw "Unsupported match field '$Field'." }
+    foreach ($Field in @($Config.Sync.UniqueMatchPriority)) {
+        if ($AllowedUniqueMatchFields -notcontains [string]$Field) { throw "Unsupported unique match field '$Field'." }
     }
 
-    foreach ($Field in @($Config.Sync.UpdateFields + $Config.Sync.CreateFields)) {
+    foreach ($Field in @($Config.Sync.FallbackMatchPriority)) {
+        if ($AllowedFallbackMatchFields -notcontains [string]$Field) { throw "Unsupported fallback match field '$Field'." }
+    }
+
+    foreach ($Field in @($Config.Sync.UpdateFields)) {
         if ($AllowedDeviceFields -notcontains [string]$Field) { throw "Unsupported sync field '$Field'." }
         if (-not $Config.FieldMappings.PSObject.Properties.Name.Contains([string]$Field)) { throw "Field '$Field' is enabled but has no FieldMappings entry." }
     }
@@ -203,25 +265,76 @@ function New-RuntimeContext {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Config)
 
-    $EffectiveMode = if ($DryRun) { 'Plan' } elseif ($Mode) { $Mode } elseif ($Config.Sync.Mode) { [string]$Config.Sync.Mode } else { 'Plan' }
-    if ($EffectiveMode -eq 'Apply' -and -not ($AllowCreate -or $AllowUpdate)) {
-        throw 'Apply mode requires at least one explicit write switch: -AllowCreate or -AllowUpdate.'
+    if (-not $IsWindows) {
+        throw 'This production script is Windows-only because Microsoft Graph certificate-thumbprint authentication depends on the Windows certificate store.'
     }
 
+    if ($AllowCreate) {
+        throw 'Snipe-IT create mode is disabled. Existing asset updates are supported; create mode requires explicit StatusId, ModelId, and AssetTag strategy implementation first.'
+    }
+
+    $EffectiveMode = if ($DryRun) { 'Plan' } elseif ($Mode) { $Mode } elseif ($Config.Sync.Mode) { [string]$Config.Sync.Mode } else { 'Plan' }
+    if ($EffectiveMode -eq 'Apply' -and -not $AllowUpdate) {
+        throw 'Apply mode requires explicit -AllowUpdate. Create mode is intentionally disabled.'
+    }
+
+    $RequireFullyQualifiedOutput = [bool]$NonInteractive
+    $Config.Logging.LogPath = Test-SafeOutputPath -Path $Config.Logging.LogPath -Purpose 'Log' -RequireFullyQualified:$RequireFullyQualifiedOutput
+    $Config.Logging.ReportPath = Test-SafeOutputPath -Path $Config.Logging.ReportPath -Purpose 'Report' -RequireFullyQualified:$RequireFullyQualifiedOutput
+
     $Context = [pscustomobject]@{
-        Config                 = $Config
-        Mode                   = $EffectiveMode
-        SnipeItApiToken        = Get-EnvironmentSecret -Name $Config.SnipeIt.ApiTokenEnvironmentVariable -Purpose 'Snipe-IT API token'
-        AzureTenantId          = Get-EnvironmentSecret -Name $Config.Azure.TenantIdEnvironmentVariable -Purpose 'Azure tenant ID'
-        AzureClientId          = Get-EnvironmentSecret -Name $Config.Azure.ClientIdEnvironmentVariable -Purpose 'Azure client ID'
-        AzureCertThumbprint    = Get-EnvironmentSecret -Name $Config.Azure.CertificateThumbprintEnvironmentVariable -Purpose 'Azure certificate thumbprint'
-        AllowCreate            = [bool]$AllowCreate
-        AllowUpdate            = [bool]$AllowUpdate
-        NonInteractive         = [bool]$NonInteractive
+        Config              = $Config
+        Mode                = $EffectiveMode
+        SnipeItApiToken     = Get-EnvironmentSecret -Name $Config.SnipeIt.ApiTokenEnvironmentVariable -Purpose 'Snipe-IT API token'
+        AzureTenantId       = Get-EnvironmentSecret -Name $Config.Azure.TenantIdEnvironmentVariable -Purpose 'Azure tenant ID'
+        AzureClientId       = Get-EnvironmentSecret -Name $Config.Azure.ClientIdEnvironmentVariable -Purpose 'Azure client ID'
+        AzureCertThumbprint = Get-EnvironmentSecret -Name $Config.Azure.CertificateThumbprintEnvironmentVariable -Purpose 'Azure certificate thumbprint'
+        AllowUpdate         = [bool]$AllowUpdate
+        NonInteractive      = [bool]$NonInteractive
     }
 
     $Script:Summary.Mode = $EffectiveMode
     return $Context
+}
+
+function New-SyncLockPath {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ConfigFilePath)
+
+    $FullConfigPath = Resolve-SafeFullPath -Path $ConfigFilePath
+    $Bytes = [System.Text.Encoding]::UTF8.GetBytes($FullConfigPath.ToUpperInvariant())
+    $HashBytes = [System.Security.Cryptography.SHA256]::HashData($Bytes)
+    $Hash = -join ($HashBytes | ForEach-Object { $_.ToString('x2') })
+    return Join-Path ([System.IO.Path]::GetTempPath()) "snipeit-azure-sync-$Hash.lock"
+}
+
+function Enter-SyncLock {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ConfigFilePath)
+
+    $Script:LockPath = New-SyncLockPath -ConfigFilePath $ConfigFilePath
+    try {
+        $Script:LockStream = [System.IO.File]::Open($Script:LockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        $LockData = [System.Text.Encoding]::UTF8.GetBytes("Pid=$PID; StartedAt=$((Get-Date).ToUniversalTime().ToString('o')); CorrelationId=$Script:CorrelationId")
+        $Script:LockStream.Write($LockData, 0, $LockData.Length)
+        $Script:LockStream.Flush()
+    }
+    catch {
+        throw "Another Snipe-IT Azure sync appears to be running for this configuration. Lock path: $Script:LockPath"
+    }
+}
+
+function Exit-SyncLock {
+    [CmdletBinding()]
+    param()
+
+    if ($Script:LockStream) {
+        $Script:LockStream.Dispose()
+        $Script:LockStream = $null
+    }
+    if ($Script:LockPath -and (Test-Path -LiteralPath $Script:LockPath)) {
+        Remove-Item -LiteralPath $Script:LockPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-RetryRequest {
@@ -269,6 +382,7 @@ function Connect-GraphSafe {
     [CmdletBinding()]
     param()
 
+    if (-not $IsWindows) { throw 'Windows is required for certificate-thumbprint authentication in this script.' }
     if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
         throw 'Microsoft.Graph.Authentication module is required. Install it before running the sync.'
     }
@@ -311,7 +425,7 @@ function Get-AzureDevice {
 function Invoke-SnipeItRequest {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][ValidateSet('GET', 'POST', 'PATCH')][string]$Method,
+        [Parameter(Mandatory)][ValidateSet('GET', 'PATCH')][string]$Method,
         [Parameter(Mandatory)][string]$Path,
         [Parameter()][object]$Body
     )
@@ -333,14 +447,18 @@ function Invoke-SnipeItRequest {
     }
 }
 
-function Assert-SnipeItResponse {
+function Assert-SnipeItWriteResponse {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Response,
         [Parameter(Mandatory)][string]$Operation
     )
 
-    if ($Response.PSObject.Properties.Name -contains 'status' -and [string]$Response.status -notin @('success', 'ok')) {
+    if (-not ($Response.PSObject.Properties.Name -contains 'status')) {
+        throw "Snipe-IT $Operation returned an unexpected response without a status field."
+    }
+
+    if ([string]$Response.status -notin @('success', 'ok')) {
         $Message = if ($Response.PSObject.Properties.Name -contains 'messages') { ConvertTo-Json -InputObject (ConvertTo-RedactedValue -Value $Response.messages) -Compress } else { 'No Snipe-IT validation details returned.' }
         throw "Snipe-IT $Operation failed validation: $Message"
     }
@@ -371,9 +489,23 @@ function Test-BadSerialNumber {
 
     if ([string]::IsNullOrWhiteSpace($SerialNumber)) { return $true }
     foreach ($BadSerial in @($Script:Runtime.Config.Sync.BadSerialNumbers)) {
-        if ($SerialNumber.Trim().Equals([string]$BadSerial, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ((Normalize-MatchValue -KeyName 'SerialNumber' -KeyValue $SerialNumber) -eq (Normalize-MatchValue -KeyName 'SerialNumber' -KeyValue ([string]$BadSerial))) { return $true }
     }
     return $false
+}
+
+function Normalize-MatchValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$KeyName,
+        [AllowNull()][string]$KeyValue
+    )
+
+    if ([string]::IsNullOrWhiteSpace($KeyValue)) { return $null }
+    $Value = ($KeyValue -replace '[\u0000-\u001F\u007F]', '').Trim()
+    $Value = $Value -replace '\s+', ' '
+    if ($KeyName -eq 'SerialNumber') { $Value = $Value -replace '[\s-]', '' }
+    return $Value.ToUpperInvariant()
 }
 
 function ConvertTo-NormalizedAzureDevice {
@@ -416,22 +548,41 @@ function Add-UniqueLookupValue {
         [Parameter(Mandatory)][string]$SourceName
     )
 
-    if ([string]::IsNullOrWhiteSpace($KeyValue)) { return }
+    $NormalizedKey = Normalize-MatchValue -KeyName $KeyName -KeyValue $KeyValue
+    if ([string]::IsNullOrWhiteSpace($NormalizedKey)) { return }
     if ($KeyName -eq 'SerialNumber' -and (Test-BadSerialNumber -SerialNumber $KeyValue)) { return }
-    $NormalizedKey = $KeyValue.Trim().ToUpperInvariant()
     if (-not $Lookup.ContainsKey($KeyName)) { $Lookup[$KeyName] = @{} }
     if ($Lookup[$KeyName].ContainsKey($NormalizedKey)) { throw "Duplicate $SourceName value detected for $KeyName. Resolve duplicates before syncing." }
     $Lookup[$KeyName][$NormalizedKey] = $Item
+}
+
+function Add-FallbackLookupValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Lookup,
+        [Parameter(Mandatory)][string]$KeyName,
+        [AllowNull()][string]$KeyValue,
+        [Parameter(Mandatory)][object]$Item
+    )
+
+    $NormalizedKey = Normalize-MatchValue -KeyName $KeyName -KeyValue $KeyValue
+    if ([string]::IsNullOrWhiteSpace($NormalizedKey)) { return }
+    if (-not $Lookup.ContainsKey($KeyName)) { $Lookup[$KeyName] = @{} }
+    if (-not $Lookup[$KeyName].ContainsKey($NormalizedKey)) { $Lookup[$KeyName][$NormalizedKey] = [System.Collections.Generic.List[object]]::new() }
+    $Lookup[$KeyName][$NormalizedKey].Add($Item)
 }
 
 function New-AssetLookup {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object[]]$Assets)
 
-    $Lookup = @{}
+    $Lookup = @{ Unique = @{}; Fallback = @{} }
     foreach ($Asset in $Assets) {
-        foreach ($KeyName in @($Script:Runtime.Config.Sync.MatchPriority)) {
-            Add-UniqueLookupValue -Lookup $Lookup -KeyName $KeyName -KeyValue ([string](Get-SnipeAssetFieldValue -Asset $Asset -LogicalField $KeyName)) -Item $Asset -SourceName 'Snipe-IT asset'
+        foreach ($KeyName in @($Script:Runtime.Config.Sync.UniqueMatchPriority)) {
+            Add-UniqueLookupValue -Lookup $Lookup.Unique -KeyName $KeyName -KeyValue ([string](Get-SnipeAssetFieldValue -Asset $Asset -LogicalField $KeyName)) -Item $Asset -SourceName 'Snipe-IT asset'
+        }
+        foreach ($KeyName in @($Script:Runtime.Config.Sync.FallbackMatchPriority)) {
+            Add-FallbackLookupValue -Lookup $Lookup.Fallback -KeyName $KeyName -KeyValue ([string](Get-SnipeAssetFieldValue -Asset $Asset -LogicalField $KeyName)) -Item $Asset
         }
     }
     return $Lookup
@@ -443,7 +594,7 @@ function Test-AzureDuplicateKey {
 
     $Lookup = @{}
     foreach ($Device in $Devices) {
-        foreach ($KeyName in @($Script:Runtime.Config.Sync.MatchPriority)) {
+        foreach ($KeyName in @($Script:Runtime.Config.Sync.UniqueMatchPriority)) {
             Add-UniqueLookupValue -Lookup $Lookup -KeyName $KeyName -KeyValue ([string]$Device.$KeyName) -Item $Device -SourceName 'Azure device'
         }
     }
@@ -456,28 +607,34 @@ function Find-SnipeItAssetMatch {
         [Parameter(Mandatory)][hashtable]$AssetLookup
     )
 
-    foreach ($KeyName in @($Script:Runtime.Config.Sync.MatchPriority)) {
-        $Value = [string]$AzureDevice.$KeyName
-        if ([string]::IsNullOrWhiteSpace($Value)) { continue }
-        if ($KeyName -eq 'SerialNumber' -and (Test-BadSerialNumber -SerialNumber $Value)) { continue }
-        $NormalizedKey = $Value.Trim().ToUpperInvariant()
-        if ($AssetLookup.ContainsKey($KeyName) -and $AssetLookup[$KeyName].ContainsKey($NormalizedKey)) {
-            return [pscustomobject]@{ Asset = $AssetLookup[$KeyName][$NormalizedKey]; MatchKey = $KeyName; MatchValue = $Value }
+    foreach ($KeyName in @($Script:Runtime.Config.Sync.UniqueMatchPriority)) {
+        $NormalizedKey = Normalize-MatchValue -KeyName $KeyName -KeyValue ([string]$AzureDevice.$KeyName)
+        if ([string]::IsNullOrWhiteSpace($NormalizedKey)) { continue }
+        if ($KeyName -eq 'SerialNumber' -and (Test-BadSerialNumber -SerialNumber ([string]$AzureDevice.$KeyName))) { continue }
+        if ($AssetLookup.Unique.ContainsKey($KeyName) -and $AssetLookup.Unique[$KeyName].ContainsKey($NormalizedKey)) {
+            return [pscustomobject]@{ Asset = $AssetLookup.Unique[$KeyName][$NormalizedKey]; MatchKey = $KeyName; MatchValue = $AzureDevice.$KeyName }
         }
     }
+
+    foreach ($KeyName in @($Script:Runtime.Config.Sync.FallbackMatchPriority)) {
+        $NormalizedKey = Normalize-MatchValue -KeyName $KeyName -KeyValue ([string]$AzureDevice.$KeyName)
+        if ([string]::IsNullOrWhiteSpace($NormalizedKey)) { continue }
+        if ($AssetLookup.Fallback.ContainsKey($KeyName) -and $AssetLookup.Fallback[$KeyName].ContainsKey($NormalizedKey)) {
+            $Matches = @($AssetLookup.Fallback[$KeyName][$NormalizedKey])
+            if ($Matches.Count -eq 1) { return [pscustomobject]@{ Asset = $Matches[0]; MatchKey = $KeyName; MatchValue = $AzureDevice.$KeyName } }
+            Write-SyncLog -Level Warning -Message 'Fallback match is ambiguous; skipping fallback match.' -Data @{ DeviceName = $AzureDevice.DeviceName; MatchKey = $KeyName; MatchValue = $AzureDevice.$KeyName; MatchCount = $Matches.Count }
+        }
+    }
+
     return $null
 }
 
 function New-SnipeItPayload {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][object]$AzureDevice,
-        [Parameter(Mandatory)][ValidateSet('Create', 'Update')][string]$Operation
-    )
+    param([Parameter(Mandatory)][object]$AzureDevice)
 
-    $AllowedFields = if ($Operation -eq 'Create') { @($Script:Runtime.Config.Sync.CreateFields) } else { @($Script:Runtime.Config.Sync.UpdateFields) }
     $Payload = [ordered]@{}
-    foreach ($LogicalField in $AllowedFields) {
+    foreach ($LogicalField in @($Script:Runtime.Config.Sync.UpdateFields)) {
         $MappedName = $Script:Runtime.Config.FieldMappings.$LogicalField
         $Value = $AzureDevice.$LogicalField
         if ($null -ne $Value -and -not [string]::IsNullOrWhiteSpace([string]$Value)) {
@@ -495,10 +652,12 @@ function Compare-SnipeItPayload {
     )
 
     $Changes = [ordered]@{}
-    foreach ($Key in $Payload.Keys) {
-        $Current = if ($Asset.PSObject.Properties.Name -contains $Key) { $Asset.$Key } else { $null }
-        if ([string]$Current -ne [string]$Payload[$Key]) {
-            $Changes[$Key] = [ordered]@{ Current = $Current; Proposed = $Payload[$Key] }
+    foreach ($LogicalField in @($Script:Runtime.Config.Sync.UpdateFields)) {
+        $MappedName = $Script:Runtime.Config.FieldMappings.$LogicalField
+        if (-not $Payload.Contains($MappedName)) { continue }
+        $Current = Get-SnipeAssetFieldValue -Asset $Asset -LogicalField $LogicalField
+        if ([string]$Current -ne [string]$Payload[$MappedName]) {
+            $Changes[$MappedName] = [ordered]@{ Current = $Current; Proposed = $Payload[$MappedName] }
         }
     }
     return $Changes
@@ -524,26 +683,12 @@ function Invoke-Sync {
 
             $Match = Find-SnipeItAssetMatch -AzureDevice $Device -AssetLookup $AssetLookup
             if ($null -eq $Match) {
-                $Payload = New-SnipeItPayload -AzureDevice $Device -Operation Create
-                if (-not $Script:Runtime.AllowCreate) {
-                    Write-SyncLog -Level Info -Message 'Create skipped because -AllowCreate is not set.' -Data @{ DeviceName = $Device.DeviceName; SerialNumber = $Device.SerialNumber }
-                    $Script:Summary.Skipped++
-                    continue
-                }
-
-                if ($Script:Runtime.Mode -eq 'Plan') {
-                    Write-SyncLog -Level Info -Message 'Snipe-IT asset would be created.' -Data @{ DeviceName = $Device.DeviceName; SerialNumber = $Device.SerialNumber; Payload = $Payload }
-                    $Script:Summary.WouldCreate++
-                    continue
-                }
-
-                $Response = Invoke-SnipeItRequest -Method POST -Path 'hardware' -Body $Payload
-                Assert-SnipeItResponse -Response $Response -Operation 'create asset'
-                $Script:Summary.Created++
+                Write-SyncLog -Level Info -Message 'Create skipped because create mode is disabled.' -Data @{ DeviceName = $Device.DeviceName; SerialNumber = $Device.SerialNumber }
+                $Script:Summary.Skipped++
                 continue
             }
 
-            $Payload = New-SnipeItPayload -AzureDevice $Device -Operation Update
+            $Payload = New-SnipeItPayload -AzureDevice $Device
             $Changes = Compare-SnipeItPayload -Asset $Match.Asset -Payload $Payload
             if ($Changes.Count -eq 0) {
                 Write-SyncLog -Level Debug -Message 'Asset already up to date.' -Data @{ DeviceName = $Device.DeviceName; MatchKey = $Match.MatchKey; MatchValue = $Match.MatchValue }
@@ -564,7 +709,7 @@ function Invoke-Sync {
             }
 
             $Response = Invoke-SnipeItRequest -Method PATCH -Path "hardware/$($Match.Asset.id)" -Body $Payload
-            Assert-SnipeItResponse -Response $Response -Operation 'update asset'
+            Assert-SnipeItWriteResponse -Response $Response -Operation 'update asset'
             $Script:Summary.Updated++
         }
         catch {
@@ -581,33 +726,43 @@ function Write-SyncReport {
 
     $Script:Summary.FinishedAt = (Get-Date).ToUniversalTime().ToString('o')
     if ($Script:Runtime -and $Script:Runtime.Config.Logging.ReportPath) {
-        $ReportDirectory = Split-Path -Parent $Script:Runtime.Config.Logging.ReportPath
-        if ($ReportDirectory -and -not (Test-Path -LiteralPath $ReportDirectory)) {
-            New-Item -ItemType Directory -Path $ReportDirectory -Force | Out-Null
-        }
         ConvertTo-RedactedValue -Value $Script:Summary | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Script:Runtime.Config.Logging.ReportPath -Encoding UTF8
     }
     Write-Output ($Script:Summary | ConvertTo-Json -Depth 12)
 }
 
-try {
-    $Config = Read-SyncConfig -Path $ConfigPath
-    $Script:Runtime = New-RuntimeContext -Config $Config
-    Write-SyncLog -Level Info -Message 'Starting Snipe-IT Azure synchronization.' -Data @{ Mode = $Script:Runtime.Mode; AllowCreate = $Script:Runtime.AllowCreate; AllowUpdate = $Script:Runtime.AllowUpdate; NonInteractive = $Script:Runtime.NonInteractive }
-    Invoke-Sync
-    Write-SyncReport
-    if ($Script:Summary.Failed -gt 0) { exit $ExitCodes.PartialSyncFailure }
-    exit $ExitCodes.Success
-}
-catch {
-    $SafeMessage = $_.Exception.Message
-    $Script:Summary.Errors += $SafeMessage
-    if ($Script:Runtime) { Write-SyncLog -Level Error -Message 'Synchronization failed.' -Data @{ Error = $SafeMessage } } else { Write-Error $SafeMessage }
-    Write-SyncReport
+function Invoke-Main {
+    [CmdletBinding()]
+    param()
 
-    if ($SafeMessage -match 'configuration|config|unsupported|field|HTTPS|environment variable|secret source') { exit $ExitCodes.ConfigurationError }
-    if ($SafeMessage -match 'authentication|certificate|Connect-MgGraph') { exit $ExitCodes.AuthenticationFailure }
-    if ($SafeMessage -match 'API|HTTP|connect|timeout') { exit $ExitCodes.ApiConnectivityFailure }
-    if ($SafeMessage -match 'duplicate|validation|serial') { exit $ExitCodes.ValidationFailure }
-    exit $ExitCodes.GeneralFailure
+    try {
+        Enter-SyncLock -ConfigFilePath $ConfigPath
+        $Config = Read-SyncConfig -Path $ConfigPath
+        $Script:Runtime = New-RuntimeContext -Config $Config
+        Write-SyncLog -Level Info -Message 'Starting Snipe-IT Azure synchronization.' -Data @{ Mode = $Script:Runtime.Mode; AllowUpdate = $Script:Runtime.AllowUpdate; NonInteractive = $Script:Runtime.NonInteractive }
+        Invoke-Sync
+        Write-SyncReport
+        if ($Script:Summary.Failed -gt 0) { exit $ExitCodes.PartialSyncFailure }
+        exit $ExitCodes.Success
+    }
+    catch {
+        $SafeMessage = $_.Exception.Message
+        $Script:Summary.Errors += $SafeMessage
+        if ($Script:Runtime) { Write-SyncLog -Level Error -Message 'Synchronization failed.' -Data @{ Error = $SafeMessage } } else { Write-Error $SafeMessage }
+        Write-SyncReport
+
+        if ($SafeMessage -match 'Another Snipe-IT Azure sync') { exit $ExitCodes.ConcurrencyBlocked }
+        if ($SafeMessage -match 'configuration|config|unsupported|field|HTTPS|environment variable|secret source|create mode|fully qualified|permissions|Windows-only|Windows is required') { exit $ExitCodes.ConfigurationError }
+        if ($SafeMessage -match 'authentication|certificate|Connect-MgGraph') { exit $ExitCodes.AuthenticationFailure }
+        if ($SafeMessage -match 'API|HTTP|connect|timeout') { exit $ExitCodes.ApiConnectivityFailure }
+        if ($SafeMessage -match 'duplicate|validation|serial|unexpected response') { exit $ExitCodes.ValidationFailure }
+        exit $ExitCodes.GeneralFailure
+    }
+    finally {
+        Exit-SyncLock
+    }
+}
+
+if ($MyInvocation.InvocationName -ne '.') {
+    Invoke-Main
 }
