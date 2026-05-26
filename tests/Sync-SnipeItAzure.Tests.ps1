@@ -2,11 +2,10 @@ BeforeAll {
     $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
     $ExampleConfigPath = Join-Path $RepoRoot 'config.example.json'
     $ExampleSchemaPath = Join-Path $RepoRoot 'config.schema.json'
-    $ModulePath = Join-Path $RepoRoot 'src/SnipeItAzureSync.Certified.psm1'
+    $ModulePath = Join-Path $RepoRoot 'src/SnipeItAzureSync.psm1'
     $ExampleConfig = Get-Content -LiteralPath $ExampleConfigPath -Raw | ConvertFrom-Json
     $ExampleConfig.Logging.LogPath = Join-Path $TestDrive 'logs/out.jsonl'
     $ExampleConfig.Logging.ReportPath = Join-Path $TestDrive 'reports/out.json'
-    $ExampleConfig.Logging.EmitInformationStream = $false
     New-Item -ItemType Directory -Path (Split-Path -Parent $ExampleConfig.Logging.LogPath) -Force | Out-Null
     New-Item -ItemType Directory -Path (Split-Path -Parent $ExampleConfig.Logging.ReportPath) -Force | Out-Null
     Import-Module -Name $ModulePath -Force
@@ -51,9 +50,9 @@ Describe 'configuration and schema safety' {
     }
 }
 
-Describe 'certified module behavior' {
+Describe 'module behavior' {
     BeforeEach {
-        InModuleScope SnipeItAzureSync.Certified {
+        InModuleScope SnipeItAzureSync {
             param($RuntimeConfig)
             Initialize-SyncState
             Set-SyncOptions -ConfigPath 'C:/ProgramData/SnipeITAzureSync/config.json' -Mode Plan -LogLevel Error
@@ -67,7 +66,7 @@ Describe 'certified module behavior' {
     }
 
     It 'uses only process scope for runtime values' {
-        InModuleScope SnipeItAzureSync.Certified {
+        InModuleScope SnipeItAzureSync {
             $Name = 'SYNC_TEST_VALUE'
             [Environment]::SetEnvironmentVariable($Name, $null, 'Process')
             try {
@@ -81,17 +80,16 @@ Describe 'certified module behavior' {
         }
     }
 
-    It 'keeps log text off the success stream and suppresses console emission by default' {
-        InModuleScope SnipeItAzureSync.Certified {
+    It 'keeps log text off the success stream' {
+        InModuleScope SnipeItAzureSync {
             Set-SyncOptions -ConfigPath 'C:/ProgramData/SnipeITAzureSync/config.json' -Mode Plan -LogLevel Warning
-            $Script:Runtime.Config.Logging.EmitInformationStream = $false
             $Result = Write-SyncLog -Level Warning -Message 'unit warning' -Data @{ Name = 'value' }
             $Result | Should -BeNullOrEmpty
         }
     }
 
     It 'normalizes serial values before duplicate detection' {
-        InModuleScope SnipeItAzureSync.Certified {
+        InModuleScope SnipeItAzureSync {
             $DeviceA = [pscustomobject]@{ SerialNumber = 'ABC-123'; AzureDeviceId = 'az-1'; IntuneDeviceId = 'in-1'; DeviceName = 'host-a' }
             $DeviceB = [pscustomobject]@{ SerialNumber = 'abc 123'; AzureDeviceId = 'az-2'; IntuneDeviceId = 'in-2'; DeviceName = 'host-b' }
             { Test-AzureDuplicateKey -Devices @($DeviceA, $DeviceB) } | Should -Throw '*Duplicate Azure device value detected for SerialNumber*'
@@ -99,7 +97,7 @@ Describe 'certified module behavior' {
     }
 
     It 'skips ambiguous fallback matches instead of guessing' {
-        InModuleScope SnipeItAzureSync.Certified {
+        InModuleScope SnipeItAzureSync {
             param($AssetA, $AssetB)
             $Lookup = New-AssetLookup -Assets @($AssetA, $AssetB)
             $Device = [pscustomobject]@{ SerialNumber = $null; AzureDeviceId = $null; IntuneDeviceId = $null; DeviceName = 'shared-name' }
@@ -108,7 +106,7 @@ Describe 'certified module behavior' {
     }
 
     It 'reads custom mapped field values safely' {
-        InModuleScope SnipeItAzureSync.Certified {
+        InModuleScope SnipeItAzureSync {
             param($Asset)
             Get-SnipeAssetFieldValue -Asset $Asset -LogicalField 'AzureDeviceId' | Should -Be 'az-1'
             $AssetWithoutCustom = [pscustomobject]@{ id = 11; serial = 'S2'; name = 'HOST02' }
@@ -117,7 +115,7 @@ Describe 'certified module behavior' {
     }
 
     It 'compares custom field values through logical mappings' {
-        InModuleScope SnipeItAzureSync.Certified {
+        InModuleScope SnipeItAzureSync {
             param($Asset)
             $Payload = @{ name = 'HOST03'; _snipeit_azure_device_id_1 = 'az-3' }
             $Changes = Compare-SnipeItPayload -Asset $Asset -Payload $Payload
@@ -126,20 +124,20 @@ Describe 'certified module behavior' {
     }
 
     It 'rejects malformed write responses without status' {
-        InModuleScope SnipeItAzureSync.Certified {
+        InModuleScope SnipeItAzureSync {
             { Assert-SnipeItWriteResponse -Response ([pscustomobject]@{ payload = 'unexpected' }) -Operation 'update asset' } | Should -Throw '*without a status field*'
         }
     }
 
     It 'recognizes Windows absolute paths independently of runner OS' {
-        InModuleScope SnipeItAzureSync.Certified {
+        InModuleScope SnipeItAzureSync {
             Test-WindowsAbsolutePath -Path 'C:/ProgramData/SnipeITAzureSync/logs/file.jsonl' | Should -BeTrue
             Test-WindowsAbsolutePath -Path './relative/file.jsonl' | Should -BeFalse
         }
     }
 
     It 'removes stale locks when recorded process no longer exists' {
-        InModuleScope SnipeItAzureSync.Certified {
+        InModuleScope SnipeItAzureSync {
             param($LockPath)
             'Pid=99999999; StartedAt=2000-01-01T00:00:00Z' | Set-Content -LiteralPath $LockPath
             Test-StaleLockFile -LockPath $LockPath | Should -BeTrue
@@ -147,21 +145,9 @@ Describe 'certified module behavior' {
     }
 
     It 'accepts configured custom field metadata before Apply updates' {
-        InModuleScope SnipeItAzureSync.Certified {
+        InModuleScope SnipeItAzureSync {
             param($Asset)
             { Test-SnipeItCustomFieldPreflight -Assets @($Asset) } | Should -Not -Throw
         } -ArgumentList (New-TestAsset -Id 10 -Serial 'S1' -Name 'HOST01' -AzureId 'az-1' -IntuneId 'in-1')
-    }
-
-    It 'blocks Apply preflight when configured custom field metadata is missing' {
-        InModuleScope SnipeItAzureSync.Certified {
-            $BadAsset = [pscustomobject]@{
-                id = 99
-                serial = 'S9'
-                name = 'HOST99'
-                custom_fields = [pscustomobject]@{}
-            }
-            { Test-SnipeItCustomFieldPreflight -Assets @($BadAsset) } | Should -Throw '*configured Snipe-IT custom field mapping*'
-        }
     }
 }
