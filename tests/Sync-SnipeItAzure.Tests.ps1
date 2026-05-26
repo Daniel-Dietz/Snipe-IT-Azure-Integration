@@ -16,18 +16,47 @@ BeforeAll {
             [string]$Serial,
             [string]$Name,
             [string]$AzureId = '',
-            [string]$IntuneId = ''
+            [string]$IntuneId = '',
+            [string]$AssignedUser = ''
         )
 
         [pscustomobject]@{
             id = $Id
             serial = $Serial
             name = $Name
+            assigned_user = $AssignedUser
             custom_fields = [pscustomobject]@{
                 '_snipeit_azure_device_id_1' = [pscustomobject]@{ value = $AzureId }
                 '_snipeit_intune_device_id_2' = [pscustomobject]@{ value = $IntuneId }
             }
         }
+    }
+
+    function New-TestManagedDevice {
+        param(
+            [string]$Id = 'intune-1',
+            [string]$AzureId = 'azure-1',
+            [string]$Name = 'HOST01',
+            [string]$Serial = 'SERIAL01',
+            [string]$Manufacturer = 'Vendor',
+            [string]$Model = 'Model',
+            [string]$User = 'user@example.com'
+        )
+
+        [pscustomobject]@{
+            id = $Id
+            azureADDeviceId = $AzureId
+            deviceName = $Name
+            serialNumber = $Serial
+            manufacturer = $Manufacturer
+            model = $Model
+            userPrincipalName = $User
+        }
+    }
+
+    function Copy-TestConfig {
+        param([object]$Config = $ExampleConfig)
+        return ($Config | ConvertTo-Json -Depth 20 | ConvertFrom-Json)
     }
 }
 
@@ -62,7 +91,7 @@ Describe 'module behavior' {
                 AllowUpdate    = $false
                 NonInteractive = $false
             }
-        } -ArgumentList $ExampleConfig
+        } -ArgumentList (Copy-TestConfig)
     }
 
     It 'uses only process scope for runtime values' {
@@ -88,6 +117,32 @@ Describe 'module behavior' {
         }
     }
 
+    It 'rejects runtime configuration values outside the production schema contract' {
+        InModuleScope SnipeItAzureSync {
+            param($RuntimeConfig)
+            $RuntimeConfig.SnipeIt.PageSize = 9999
+            { Assert-SyncConfigShape -Config $RuntimeConfig } | Should -Throw '*SnipeIt.PageSize*between 1 and 500*'
+        } -ArgumentList (Copy-TestConfig)
+    }
+
+    It 'rejects unsupported runtime configuration properties' {
+        InModuleScope SnipeItAzureSync {
+            param($RuntimeConfig)
+            $RuntimeConfig.SnipeIt | Add-Member -NotePropertyName ApiToken -NotePropertyValue 'must-not-exist'
+            { Assert-SyncConfigShape -Config $RuntimeConfig } | Should -Throw '*unsupported property*ApiToken*'
+        } -ArgumentList (Copy-TestConfig)
+    }
+
+    It 'validates existing output parents before creating missing leaf directories' {
+        InModuleScope SnipeItAzureSync {
+            param($Root)
+            $Target = Join-Path $Root 'missing/out.jsonl'
+            $Resolved = Test-SafeOutputPath -Path $Target -Purpose 'Log'
+            $Resolved | Should -Be ([System.IO.Path]::GetFullPath($Target))
+            Test-Path -LiteralPath (Split-Path -Parent $Target) | Should -BeTrue
+        } -ArgumentList $TestDrive
+    }
+
     It 'normalizes serial values before duplicate detection' {
         InModuleScope SnipeItAzureSync {
             $DeviceA = [pscustomobject]@{ SerialNumber = 'ABC-123'; AzureDeviceId = 'az-1'; IntuneDeviceId = 'in-1'; DeviceName = 'host-a' }
@@ -103,6 +158,17 @@ Describe 'module behavior' {
             $Device = [pscustomobject]@{ SerialNumber = $null; AzureDeviceId = $null; IntuneDeviceId = $null; DeviceName = 'shared-name' }
             Find-SnipeItAssetMatch -AzureDevice $Device -AssetLookup $Lookup | Should -BeNullOrEmpty
         } -ArgumentList (New-TestAsset -Id 1 -Serial 'A1' -Name 'shared-name'), (New-TestAsset -Id 2 -Serial 'B1' -Name 'shared-name')
+    }
+
+    It 'matches by Azure device ID even when the serial number is missing or invalid' {
+        InModuleScope SnipeItAzureSync {
+            param($Asset)
+            $Lookup = New-AssetLookup -Assets @($Asset)
+            $Device = [pscustomobject]@{ SerialNumber = 'To Be Filled By O.E.M.'; AzureDeviceId = 'az-serialless'; IntuneDeviceId = $null; DeviceName = 'serialless-host' }
+            $Match = Find-SnipeItAssetMatch -AzureDevice $Device -AssetLookup $Lookup
+            $Match | Should -Not -BeNullOrEmpty
+            $Match.MatchKey | Should -Be 'AzureDeviceId'
+        } -ArgumentList (New-TestAsset -Id 42 -Serial '' -Name 'serialless-host' -AzureId 'az-serialless')
     }
 
     It 'reads custom mapped field values safely' {
@@ -149,5 +215,90 @@ Describe 'module behavior' {
             param($Asset)
             { Test-SnipeItCustomFieldPreflight -Assets @($Asset) } | Should -Not -Throw
         } -ArgumentList (New-TestAsset -Id 10 -Serial 'S1' -Name 'HOST01' -AzureId 'az-1' -IntuneId 'in-1')
+    }
+}
+
+Describe 'sync execution gates' {
+    BeforeEach {
+        InModuleScope SnipeItAzureSync {
+            param($RuntimeConfig)
+            Initialize-SyncState
+            Set-SyncOptions -ConfigPath 'C:/ProgramData/SnipeITAzureSync/config.json' -Mode Plan -LogLevel Error
+            $Script:Runtime = [pscustomobject]@{
+                Config         = $RuntimeConfig
+                Mode           = 'Plan'
+                AllowUpdate    = $false
+                NonInteractive = $false
+            }
+        } -ArgumentList (Copy-TestConfig)
+    }
+
+    It 'does not patch Snipe-IT in Plan mode' {
+        InModuleScope SnipeItAzureSync {
+            param($ManagedDevice, $Asset)
+            function Connect-GraphSafe { }
+            function Get-AzureDevice { @($ManagedDevice) }
+            function Get-SnipeItAsset { @($Asset) }
+            function Invoke-SnipeItRequest { throw 'PATCH must not be called in Plan mode.' }
+
+            Invoke-Sync
+            $Script:Summary.Skipped | Should -Be 1
+            $Script:Summary.Updated | Should -Be 0
+        } -ArgumentList (New-TestManagedDevice -Name 'HOST02' -Serial 'SERIAL02' -AzureId 'azure-2' -Id 'intune-2'), (New-TestAsset -Id 100 -Serial 'SERIAL02' -Name 'OLDNAME' -AzureId 'azure-2' -IntuneId 'intune-2')
+    }
+
+    It 'patches exactly the matched asset in Apply mode with AllowUpdate' {
+        InModuleScope SnipeItAzureSync {
+            param($RuntimeConfig, $ManagedDevice, $Asset)
+            $Script:Runtime = [pscustomobject]@{
+                Config         = $RuntimeConfig
+                Mode           = 'Apply'
+                AllowUpdate    = $true
+                NonInteractive = $false
+            }
+            $Script:Summary.Mode = 'Apply'
+            $Script:PatchCalls = [System.Collections.Generic.List[object]]::new()
+            function Connect-GraphSafe { }
+            function Get-AzureDevice { @($ManagedDevice) }
+            function Get-SnipeItAsset { @($Asset) }
+            function Invoke-SnipeItRequest {
+                param([string]$Method, [string]$Path, [object]$Body)
+                $Script:PatchCalls.Add([pscustomobject]@{ Method = $Method; Path = $Path; Body = $Body })
+                [pscustomobject]@{ status = 'success' }
+            }
+
+            Invoke-Sync
+            $Script:Summary.Updated | Should -Be 1
+            $Script:PatchCalls.Count | Should -Be 1
+            $Script:PatchCalls[0].Method | Should -Be 'PATCH'
+            $Script:PatchCalls[0].Path | Should -Be 'hardware/200'
+            $Script:PatchCalls[0].Body.name | Should -Be 'HOST200'
+        } -ArgumentList (Copy-TestConfig), (New-TestManagedDevice -Name 'HOST200' -Serial 'SERIAL200' -AzureId 'azure-200' -Id 'intune-200'), (New-TestAsset -Id 200 -Serial 'SERIAL200' -Name 'OLD200' -AzureId 'azure-200' -IntuneId 'intune-200')
+    }
+
+    It 'updates serialless matched assets by Azure device ID during full sync' {
+        InModuleScope SnipeItAzureSync {
+            param($RuntimeConfig, $ManagedDevice, $Asset)
+            $Script:Runtime = [pscustomobject]@{
+                Config         = $RuntimeConfig
+                Mode           = 'Apply'
+                AllowUpdate    = $true
+                NonInteractive = $false
+            }
+            $Script:Summary.Mode = 'Apply'
+            $Script:PatchCalls = [System.Collections.Generic.List[object]]::new()
+            function Connect-GraphSafe { }
+            function Get-AzureDevice { @($ManagedDevice) }
+            function Get-SnipeItAsset { @($Asset) }
+            function Invoke-SnipeItRequest {
+                param([string]$Method, [string]$Path, [object]$Body)
+                $Script:PatchCalls.Add([pscustomobject]@{ Method = $Method; Path = $Path; Body = $Body })
+                [pscustomobject]@{ status = 'success' }
+            }
+
+            Invoke-Sync
+            $Script:Summary.Updated | Should -Be 1
+            $Script:PatchCalls[0].Path | Should -Be 'hardware/300'
+        } -ArgumentList (Copy-TestConfig), (New-TestManagedDevice -Name 'SERIALLESS300' -Serial 'To Be Filled By O.E.M.' -AzureId 'azure-300' -Id 'intune-300'), (New-TestAsset -Id 300 -Serial '' -Name 'OLD300' -AzureId 'azure-300' -IntuneId 'intune-300')
     }
 }
