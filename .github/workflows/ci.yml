@@ -127,7 +127,14 @@ jobs:
           $config.TestResult.Enabled = $true
           $config.TestResult.OutputPath = 'TestResults.xml'
           $config.TestResult.OutputFormat = 'NUnitXml'
-          Invoke-Pester -Configuration $config
+          $result = Invoke-Pester -Configuration $config -PassThru
+          Write-Output "Pester summary: Total=$($result.TotalCount) Passed=$($result.PassedCount) Failed=$($result.FailedCount) Skipped=$($result.SkippedCount)"
+          if ($result.FailedCount -gt 0) {
+            foreach ($failed in @($result.Failed)) {
+              Write-Error "Pester failed: $($failed.ExpandedName) :: $($failed.ErrorRecord.Exception.Message)"
+            }
+            exit 1
+          }
 
       - name: Upload Pester test results
         if: always()
