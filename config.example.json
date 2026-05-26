@@ -1,0 +1,61 @@
+{
+  "SnipeIt": {
+    "BaseUrl": "https://snipeit.example.com",
+    "ApiTokenEnvironmentVariable": "SNIPEIT_API_TOKEN",
+    "PageSize": 100,
+    "AllowInsecureTls": false
+  },
+  "Azure": {
+    "TenantIdEnvironmentVariable": "AZURE_TENANT_ID",
+    "ClientIdEnvironmentVariable": "AZURE_CLIENT_ID",
+    "CertificateThumbprintEnvironmentVariable": "AZURE_CERT_THUMBPRINT",
+    "Source": "IntuneManagedDevices"
+  },
+  "Sync": {
+    "MissingAzureDeviceAction": "Ignore",
+    "MatchPriority": [
+      "SerialNumber",
+      "AzureDeviceId",
+      "IntuneDeviceId",
+      "AssetTag",
+      "DeviceName"
+    ],
+    "BadSerialNumbers": [
+      "To Be Filled By O.E.M.",
+      "System Serial Number",
+      "Default string",
+      "00000000",
+      "None",
+      "Unknown"
+    ],
+    "FieldPolicy": {
+      "AssetTag": "SnipeItOwned",
+      "PurchaseDate": "SnipeItOwned",
+      "Warranty": "SnipeItOwned",
+      "SerialNumber": "AzureOwned",
+      "DeviceName": "AzureOwned",
+      "Manufacturer": "AzureOwned",
+      "Model": "AzureOwned",
+      "AssignedUser": "OptionalAzureOwned"
+    }
+  },
+  "FieldMappings": {
+    "SerialNumber": "serial",
+    "DeviceName": "name",
+    "Manufacturer": "manufacturer",
+    "Model": "model",
+    "AzureDeviceId": "_snipeit_azure_device_id_1",
+    "IntuneDeviceId": "_snipeit_intune_device_id_2",
+    "AssignedUser": "assigned_user"
+  },
+  "Logging": {
+    "LogPath": "logs/snipeit-azure-sync.jsonl",
+    "ReportPath": "reports/snipeit-azure-sync-report.json",
+    "JsonLog": true
+  },
+  "Retry": {
+    "MaxAttempts": 4,
+    "InitialDelaySeconds": 2,
+    "MaxDelaySeconds": 30
+  }
+}
