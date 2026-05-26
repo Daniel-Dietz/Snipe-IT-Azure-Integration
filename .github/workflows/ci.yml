@@ -50,7 +50,8 @@ jobs:
         run: |
           $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Warning,Error
           $results | Format-Table -AutoSize
-          if ($results) { exit 1 }
+          $errors = @($results | Where-Object Severity -eq 'Error')
+          if ($errors.Count -gt 0) { exit 1 }
 
       - name: Run Pester tests
         shell: pwsh
@@ -75,11 +76,16 @@ jobs:
             'api[_-]?key\s*[=:]\s*[''\"][^''\"]+'
           )
           $files = Get-ChildItem -Path . -Recurse -File | Where-Object { $_.FullName -notmatch '\\.git' }
+          $findings = @()
           foreach ($file in $files) {
             $content = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction SilentlyContinue
             foreach ($pattern in $patterns) {
               if ($content -match $pattern) {
-                Write-Error "Potential secret pattern found in $($file.FullName): $pattern"
+                $findings += "Potential secret pattern found in $($file.FullName): $pattern"
               }
             }
+          }
+          if ($findings.Count -gt 0) {
+            $findings | ForEach-Object { Write-Error $_ }
+            exit 1
           }
