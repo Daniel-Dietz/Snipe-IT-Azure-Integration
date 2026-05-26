@@ -7,8 +7,8 @@ Production-oriented PowerShell integration to synchronize Microsoft Intune manag
 The script is intentionally conservative:
 
 - Windows-only execution is enforced because certificate-thumbprint authentication uses the Windows certificate store
-- no secrets are stored in the repository or in `config.json`
-- secrets are read only from process-scoped environment variables
+- no runtime secrets are stored in the repository or in `config.json`
+- runtime values are read only from process-scoped environment variables
 - `Plan` mode is the default and performs no Snipe-IT writes
 - writes require `Apply` mode plus `-AllowUpdate`
 - create, archive, and delete lifecycle actions are not implemented and are not exposed
@@ -17,8 +17,17 @@ The script is intentionally conservative:
 - device name is treated only as an ambiguous fallback match key
 - transient API failures are retried with exponential backoff and `Retry-After` support
 - sensitive values are recursively redacted from logs and reports
-- log/report directories are validated before use
-- a lock file prevents concurrent runs for the same configuration
+- log/report directories and existing files are validated before use
+- stale sync lock files are detected and removed when the recorded process no longer exists
+
+## Production gate
+
+Before production use, the latest commit on `main` must have a successful CI run with both jobs passing:
+
+- `Validate repository hygiene`
+- `Run Windows behavior tests`
+
+Do not deploy from a commit where either job is failing or missing.
 
 ## Requirements
 
@@ -38,16 +47,22 @@ Use the least-privilege permissions required for Intune managed device inventory
 
 Avoid broad write permissions such as `Directory.ReadWrite.All`, `Device.ReadWrite.All`, or `User.ReadWrite.All`. The script writes only to Snipe-IT.
 
+## Snipe-IT field contract
+
+Top-level Snipe-IT fields are mapped directly. Custom fields must use the Snipe-IT API field keys configured in `FieldMappings`, for example `_snipeit_azure_device_id_1`.
+
+Before enabling `Apply`, validate in `Plan` mode that proposed custom-field changes match the field keys configured in your Snipe-IT instance.
+
 ## First run
 
 Create a local config from the example file:
 
 ```powershell
-Copy-Item .\config.example.json .\config.json
-notepad .\config.json
+Copy-Item .\config.example.json C:\ProgramData\SnipeITAzureSync\config.json
+notepad C:\ProgramData\SnipeITAzureSync\config.json
 ```
 
-Provide secrets as process-scoped environment variables in the launching process or scheduled task action:
+Provide runtime values as process-scoped environment variables in the launching process or scheduled task action:
 
 ```powershell
 $env:SNIPEIT_API_TOKEN = '<token>'
@@ -59,7 +74,7 @@ $env:AZURE_CERT_THUMBPRINT = '<certificate-thumbprint>'
 Run a plan-only execution first:
 
 ```powershell
-pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath .\config.json -Mode Plan -LogLevel Info
+pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath C:\ProgramData\SnipeITAzureSync\config.json -Mode Plan -LogLevel Info
 ```
 
 Only enable updates after reviewing the plan report:
@@ -87,7 +102,7 @@ Sensitive values are redacted before logging. Protect the log and report directo
 
 ```text
 src/Sync-SnipeItAzure.ps1          Main sync script
-config.example.json                Example configuration without secrets
+config.example.json                Example configuration without runtime secrets
 config.schema.json                 JSON schema for configuration validation
 docs/runbook.md                    Operational runbook
 tests/Sync-SnipeItAzure.Tests.ps1  Pester behavior tests
