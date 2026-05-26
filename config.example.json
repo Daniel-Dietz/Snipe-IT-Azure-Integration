@@ -2,8 +2,7 @@
   "SnipeIt": {
     "BaseUrl": "https://snipeit.example.com",
     "ApiTokenEnvironmentVariable": "SNIPEIT_API_TOKEN",
-    "PageSize": 100,
-    "AllowInsecureTls": false
+    "PageSize": 100
   },
   "Azure": {
     "TenantIdEnvironmentVariable": "AZURE_TENANT_ID",
@@ -12,12 +11,11 @@
     "Source": "IntuneManagedDevices"
   },
   "Sync": {
-    "MissingAzureDeviceAction": "Ignore",
+    "Mode": "Plan",
     "MatchPriority": [
       "SerialNumber",
       "AzureDeviceId",
       "IntuneDeviceId",
-      "AssetTag",
       "DeviceName"
     ],
     "BadSerialNumbers": [
@@ -28,16 +26,23 @@
       "None",
       "Unknown"
     ],
-    "FieldPolicy": {
-      "AssetTag": "SnipeItOwned",
-      "PurchaseDate": "SnipeItOwned",
-      "Warranty": "SnipeItOwned",
-      "SerialNumber": "AzureOwned",
-      "DeviceName": "AzureOwned",
-      "Manufacturer": "AzureOwned",
-      "Model": "AzureOwned",
-      "AssignedUser": "OptionalAzureOwned"
-    }
+    "UpdateFields": [
+      "DeviceName",
+      "Manufacturer",
+      "Model",
+      "AzureDeviceId",
+      "IntuneDeviceId",
+      "AssignedUser"
+    ],
+    "CreateFields": [
+      "SerialNumber",
+      "DeviceName",
+      "Manufacturer",
+      "Model",
+      "AzureDeviceId",
+      "IntuneDeviceId",
+      "AssignedUser"
+    ]
   },
   "FieldMappings": {
     "SerialNumber": "serial",
@@ -50,8 +55,7 @@
   },
   "Logging": {
     "LogPath": "logs/snipeit-azure-sync.jsonl",
-    "ReportPath": "reports/snipeit-azure-sync-report.json",
-    "JsonLog": true
+    "ReportPath": "reports/snipeit-azure-sync-report.json"
   },
   "Retry": {
     "MaxAttempts": 4,
