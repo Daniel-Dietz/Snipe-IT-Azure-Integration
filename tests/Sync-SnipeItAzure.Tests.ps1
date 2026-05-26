@@ -2,62 +2,128 @@ BeforeAll {
     $RepoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
     $ScriptPath = Join-Path $RepoRoot 'src/Sync-SnipeItAzure.ps1'
     $ConfigPath = Join-Path $RepoRoot 'config.example.json'
-    $ScriptContent = Get-Content -LiteralPath $ScriptPath -Raw
-    $ConfigContent = Get-Content -LiteralPath $ConfigPath -Raw
+    . $ScriptPath
+
+    function New-TestRuntimeConfig {
+        $Config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+        $Config.Logging.LogPath = Join-Path $TestDrive 'logs/snipeit-azure-sync.jsonl'
+        $Config.Logging.ReportPath = Join-Path $TestDrive 'reports/snipeit-azure-sync-report.json'
+        return $Config
+    }
+
+    function Set-TestRuntime {
+        param([object]$Config)
+        $Script:Runtime = [pscustomobject]@{
+            Config              = $Config
+            Mode                = 'Plan'
+            SnipeItApiToken     = 'unit-test-token'
+            AzureTenantId       = 'unit-test-tenant'
+            AzureClientId       = 'unit-test-client'
+            AzureCertThumbprint = 'unit-test-thumbprint'
+            AllowUpdate         = $false
+            NonInteractive      = $false
+        }
+    }
 }
 
-Describe 'Snipe-IT Azure sync safety contract' {
-    It 'uses plan mode as the safe default in example configuration' {
-        $Config = $ConfigContent | ConvertFrom-Json
+Describe 'configuration safety' {
+    It 'uses plan mode and update-only synchronization by default' {
+        $Config = New-TestRuntimeConfig
         $Config.Sync.Mode | Should -Be 'Plan'
+        $Config.Sync.PSObject.Properties.Name | Should -Contain 'UpdateFields'
+        $Config.Sync.PSObject.Properties.Name | Should -Not -Contain 'CreateFields'
     }
 
-    It 'does not expose archive or delete switches in the active sync script' {
-        $ScriptContent | Should -Not -Match 'AllowArchive'
-        $ScriptContent | Should -Not -Match 'AllowDelete'
-        $ScriptContent | Should -Not -Match 'IUnderstandThisCanRemoveAssets'
-        $ScriptContent | Should -Not -Match 'MissingAzureDeviceAction'
+    It 'separates unique and fallback match keys' {
+        $Config = New-TestRuntimeConfig
+        @($Config.Sync.UniqueMatchPriority) | Should -Contain 'SerialNumber'
+        @($Config.Sync.UniqueMatchPriority) | Should -Not -Contain 'DeviceName'
+        @($Config.Sync.FallbackMatchPriority) | Should -Contain 'DeviceName'
+    }
+}
+
+Describe 'runtime secret handling' {
+    It 'reads secrets only from process scope' {
+        $Name = 'SNIPEIT_SYNC_TEST_SECRET'
+        [Environment]::SetEnvironmentVariable($Name, $null, 'Process')
+        [Environment]::SetEnvironmentVariable($Name, 'user-scope-value', 'User')
+        try {
+            { Get-EnvironmentSecret -Name $Name -Purpose 'unit test' } | Should -Throw '*process-scoped*'
+            [Environment]::SetEnvironmentVariable($Name, 'process-scope-value', 'Process')
+            Get-EnvironmentSecret -Name $Name -Purpose 'unit test' | Should -Be 'process-scope-value'
+        }
+        finally {
+            [Environment]::SetEnvironmentVariable($Name, $null, 'Process')
+            [Environment]::SetEnvironmentVariable($Name, $null, 'User')
+        }
+    }
+}
+
+Describe 'matching behavior' {
+    BeforeEach {
+        $Config = New-TestRuntimeConfig
+        Set-TestRuntime -Config $Config
     }
 
-    It 'does not support the unsafe EntraDevices source in active configuration' {
-        $Config = $ConfigContent | ConvertFrom-Json
-        $Config.Azure.Source | Should -Be 'IntuneManagedDevices'
-        $ConfigContent | Should -Not -Match 'EntraDevices'
+    It 'normalizes serial numbers before duplicate detection' {
+        $DeviceA = [pscustomobject]@{ SerialNumber = 'ABC-123'; AzureDeviceId = 'azure-1'; IntuneDeviceId = 'intune-1'; DeviceName = 'host-a' }
+        $DeviceB = [pscustomobject]@{ SerialNumber = 'abc 123'; AzureDeviceId = 'azure-2'; IntuneDeviceId = 'intune-2'; DeviceName = 'host-b' }
+        { Test-AzureDuplicateKey -Devices @($DeviceA, $DeviceB) } | Should -Throw '*Duplicate Azure device value detected for SerialNumber*'
     }
 
-    It 'removes AssetTag from default match priority because Azure does not supply it' {
-        $Config = $ConfigContent | ConvertFrom-Json
-        @($Config.Sync.MatchPriority) | Should -Not -Contain 'AssetTag'
+    It 'does not fail lookup creation on duplicate fallback device names' {
+        $AssetA = [pscustomobject]@{ id = 1; serial = 'A1'; name = 'shared-name' }
+        $AssetB = [pscustomobject]@{ id = 2; serial = 'B1'; name = 'shared-name' }
+        { New-AssetLookup -Assets @($AssetA, $AssetB) } | Should -Not -Throw
     }
 
-    It 'separates plan counters from applied write counters' {
-        $ScriptContent | Should -Match 'WouldCreate'
-        $ScriptContent | Should -Match 'WouldUpdate'
-        $ScriptContent | Should -Match 'Created'
-        $ScriptContent | Should -Match 'Updated'
+    It 'skips ambiguous fallback matches instead of guessing' {
+        $AssetA = [pscustomobject]@{ id = 1; serial = 'A1'; name = 'shared-name' }
+        $AssetB = [pscustomobject]@{ id = 2; serial = 'B1'; name = 'shared-name' }
+        $Lookup = New-AssetLookup -Assets @($AssetA, $AssetB)
+        $Device = [pscustomobject]@{ SerialNumber = $null; AzureDeviceId = $null; IntuneDeviceId = $null; DeviceName = 'shared-name' }
+        Find-SnipeItAssetMatch -AzureDevice $Device -AssetLookup $Lookup | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'payload and response behavior' {
+    BeforeEach {
+        $Config = New-TestRuntimeConfig
+        Set-TestRuntime -Config $Config
     }
 
-    It 'centralizes runtime secret loading through a single function' {
-        $ScriptContent | Should -Match 'function Get-EnvironmentSecret'
-        $ScriptContent | Should -Match 'function New-RuntimeContext'
-        ($ScriptContent | Select-String -Pattern '\[Environment\]::GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 1
+    It 'compares custom field values through logical field mappings' {
+        $Asset = [pscustomobject]@{
+            id = 10
+            name = 'HOST01'
+            custom_fields = [pscustomobject]@{
+                '_snipeit_azure_device_id_1' = [pscustomobject]@{ value = 'azure-1' }
+            }
+        }
+        $Payload = [ordered]@{ name = 'HOST01'; _snipeit_azure_device_id_1 = 'azure-1' }
+        $Changes = Compare-SnipeItPayload -Asset $Asset -Payload $Payload
+        $Changes.Count | Should -Be 0
     }
 
-    It 'validates duplicate Azure and Snipe-IT match keys before updates' {
-        $ScriptContent | Should -Match 'function Test-AzureDuplicateKey'
-        $ScriptContent | Should -Match 'function New-AssetLookup'
-        $ScriptContent | Should -Match 'Duplicate \$SourceName value detected'
+    It 'rejects malformed Snipe-IT write responses without status' {
+        { Assert-SnipeItWriteResponse -Response ([pscustomobject]@{ payload = 'unexpected' }) -Operation 'update asset' } | Should -Throw '*without a status field*'
     }
 
-    It 'validates Snipe-IT semantic responses for write operations' {
-        $ScriptContent | Should -Match 'function Assert-SnipeItResponse'
-        $ScriptContent | Should -Match 'Assert-SnipeItResponse -Response \$Response -Operation ''create asset'''
-        $ScriptContent | Should -Match 'Assert-SnipeItResponse -Response \$Response -Operation ''update asset'''
+    It 'accepts successful Snipe-IT write responses' {
+        { Assert-SnipeItWriteResponse -Response ([pscustomobject]@{ status = 'success' }) -Operation 'update asset' } | Should -Not -Throw
     }
+}
 
-    It 'does not contain obvious hard-coded bearer tokens or client secrets' {
-        $ScriptContent | Should -Not -Match 'Bearer\s+[A-Za-z0-9_\-\.]{20,}'
-        $ScriptContent | Should -Not -Match 'client_secret\s*[=:]\s*[''\"][^''\"]+'
-        $ScriptContent | Should -Not -Match 'SNIPEIT_API_TOKEN\s*=\s*[''\"][^''\"]+'
+Describe 'concurrency behavior' {
+    It 'blocks a second lock for the same config path' {
+        $ConfigFile = Join-Path $TestDrive 'config.json'
+        '{}' | Set-Content -LiteralPath $ConfigFile
+        Enter-SyncLock -ConfigFilePath $ConfigFile
+        try {
+            { Enter-SyncLock -ConfigFilePath $ConfigFile } | Should -Throw '*Another Snipe-IT Azure sync*'
+        }
+        finally {
+            Exit-SyncLock
+        }
     }
 }
