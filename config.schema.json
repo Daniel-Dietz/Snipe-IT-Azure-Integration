@@ -28,26 +28,25 @@
     },
     "Sync": {
       "type": "object",
-      "required": ["Mode", "MatchPriority", "BadSerialNumbers", "UpdateFields", "CreateFields"],
+      "required": ["Mode", "UniqueMatchPriority", "FallbackMatchPriority", "BadSerialNumbers", "UpdateFields"],
       "additionalProperties": false,
       "properties": {
         "Mode": { "type": "string", "enum": ["Plan", "Apply"] },
-        "MatchPriority": {
+        "UniqueMatchPriority": {
           "type": "array",
-          "items": { "type": "string", "enum": ["SerialNumber", "AzureDeviceId", "IntuneDeviceId", "DeviceName"] },
+          "items": { "type": "string", "enum": ["SerialNumber", "AzureDeviceId", "IntuneDeviceId"] },
           "minItems": 1,
+          "uniqueItems": true
+        },
+        "FallbackMatchPriority": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["DeviceName"] },
           "uniqueItems": true
         },
         "BadSerialNumbers": { "type": "array", "items": { "type": "string" } },
         "UpdateFields": {
           "type": "array",
           "items": { "type": "string", "enum": ["DeviceName", "Manufacturer", "Model", "AzureDeviceId", "IntuneDeviceId", "AssignedUser"] },
-          "uniqueItems": true
-        },
-        "CreateFields": {
-          "type": "array",
-          "items": { "type": "string", "enum": ["SerialNumber", "DeviceName", "Manufacturer", "Model", "AzureDeviceId", "IntuneDeviceId", "AssignedUser"] },
-          "minItems": 1,
           "uniqueItems": true
         }
       }
