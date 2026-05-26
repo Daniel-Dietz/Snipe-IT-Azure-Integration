@@ -4,7 +4,11 @@ BeforeAll {
     $SchemaPath = Join-Path $RepoRoot 'config.schema.json'
     $ScriptPath = Join-Path $RepoRoot 'src/Sync-SnipeItAzure.ps1'
     $Config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
-    . $ScriptPath
+    $RuntimeScriptPath = Join-Path $TestDrive 'Sync-SnipeItAzure.Runtime.ps1'
+    $RuntimeScript = Get-Content -LiteralPath $ScriptPath -Raw
+    $RuntimeScript = $RuntimeScript -replace "(?s)if \(\$MyInvocation\.InvocationName -ne '\.'\) \{ Invoke-Main \}\s*$", ''
+    Set-Content -LiteralPath $RuntimeScriptPath -Value $RuntimeScript -Encoding UTF8
+    . $RuntimeScriptPath
 
     function Set-TestRuntime {
         param([object]$RuntimeConfig)
