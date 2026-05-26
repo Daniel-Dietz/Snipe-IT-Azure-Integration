@@ -1,95 +1,69 @@
-#Snipe API Info
-$SnipeToken = #SnipeToken Here. Should look "Bearer asdfpiqweurpoiajs;dklfjapoieurpqwoiru..."
-$SnipeAPIBase = #SnipeAPI URI here. Should look like "https://domain.snipe-it.com/api/vi"
+#requires -Version 7.2
+<#!
+.SYNOPSIS
+Compatibility wrapper for the legacy Snipe-IT to Intune sample.
 
-#Azure API Info
-$TenantID = #Tenant ID Here
-$SecretValue = #Secret Value Here
-$ClientID = #Client ID Here
+.DESCRIPTION
+The original sample used inline placeholders and client-secret based authentication. It has been
+replaced with a safe wrapper that delegates to src/Sync-SnipeItAzure.ps1.
 
-#Converts Secret to Get-Credential Object
-$SecretString = ConvertTo-SecureString -String $SecretValue -AsPlainText -Force
-$Credential = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $ClientID, $SecretString
+Secrets must be supplied through protected environment variables or another secure runtime secret
+source. Do not store API tokens, client secrets, certificates, or passwords in this file.
 
-#Connect Graph
-Import-Module Microsoft.Graph.Beta.Devicemanagement
-Connect-MgGraph -NoWelcome -TenantId $TenantID -ClientSecretCredential $Credential
+.EXAMPLE
+$env:SNIPEIT_API_TOKEN = '<set securely outside the repository>'
+$env:AZURE_TENANT_ID = '<set securely outside the repository>'
+$env:AZURE_CLIENT_ID = '<set securely outside the repository>'
+$env:AZURE_CERT_THUMBPRINT = '<set securely outside the repository>'
+.\SnipeIT-InfoImportToIntuneSample.ps1 -DryRun
+#>
 
-#Querying all Intune Devices
-$stopwatch = [System.Diagnostics.Stopwatch]::new()
-$stopwatch.start()
-$count = 0
-$IntuneDevices = Get-MgBetaDeviceManagementManagedDevice -All
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+    [Parameter()]
+    [ValidateNotNullOrEmpty()]
+    [string]$ConfigPath = '.\config.json',
 
-Foreach ($Device in $IntuneDevices)
-{
-$SerialNum = $Device.SerialNumber
-#Querying device in Snipe by SerialNumber
-$headers=@{}
-$headers.Add("accept", "application/json")
-$headers.Add("Authorization", "$SnipeToken")
-$response = Invoke-WebRequest -Uri "$SnipeAPIBase/hardware/byserial/$SerialNum ?deleted=false" -Method GET -Headers $headers
+    [Parameter()]
+    [switch]$DryRun,
 
-#converting response to PSObject
-$PSResponseSN = $response.content | ConvertFrom-Json
+    [Parameter()]
+    [switch]$AllowCreate,
 
-#Try here is to check if the asset exists in Snipe
-Try{
-#Setting variables to the Snipe ID for the second call
-$SnipeID = $PSResponseSN.rows[0].id
+    [Parameter()]
+    [switch]$AllowUpdate,
 
-#Second request to Snipe for Checkout and Device Info
-$headers1=@{}
-$headers1.Add("accept", "application/json")
-$headers1.Add("Authorization", "$SnipeToken")
-$response1 = Invoke-WebRequest -Uri "$SnipeAPIBase/hardware/$SnipeID" -Method GET -Headers $headers
+    [Parameter()]
+    [switch]$NonInteractive
+)
 
-#converting response to PSObject. Adding a half second sleep to prevent 'too many requests' errors.
-start-sleep -seconds .5
-$PSResponseID = $response1.content | ConvertFrom-Json
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-#Getting Device Data from Response and setting equal to variables
-$AssetTag = $PSResponseID.asset_tag
-$Status = $PSResponseID.status_label[0].name
-$StatusType = $PSResponseID.status_label[0].status_type
-$StatusMeta = $PSResponseID.status_label[0].status_meta
-    try{
-    $CheckoutUser = $PSResponseID.assigned_to[0].name
-    $CheckoutTimeStamp = $PSResponseID.last_checkout[0].formatted
-    }
-    catch{
-        $CheckoutUser = "None"
-        $CheckoutTimeStamp = "this time."
-    }
-#Formatting the note for Intune
-$NoteField = @"
-[INFO FROM SNIPE IT]
-Asset Tag:    $AssetTag
-Status:    $Status > $StatusType > $StatusMeta
-Current Checkout:    $CheckoutUser at $CheckoutTimeStamp
-"@
-}
-#This will create a custom note if the device is not present in Snipe
-Catch{
-$NoteField = @"
-[INFO FROM SNIPE IT]
-
-ASSET DOES NOT EXIST
-
-"@
-    }
-Finally{
-    #Sending it up to intune in the device's note field
-    Update-MgBetaDeviceManagementManagedDevice -ManagedDeviceId $Device.id -Notes $NoteField
-    Write-Host "Device with serial"$SerialNum" has been successfully updated." -ForegroundColor yellow -BackgroundColor black
-    $count++
-}
+$SyncScriptPath = Join-Path -Path $PSScriptRoot -ChildPath 'src/Sync-SnipeItAzure.ps1'
+if (-not (Test-Path -LiteralPath $SyncScriptPath)) {
+    throw "The secure sync script was not found at '$SyncScriptPath'."
 }
 
-$stopwatch.stop()
-Write-Host ""
-Write-Host "FINISHED SYNCING $count DEVICES"
-Write-Host "Days:"$stopwatch.Elapsed.Days" Hours:"$stopwatch.Elapsed.Hours" Minutes:"$stopwatch.Elapsed.Minutes
-Write-Host ""
+$ForwardedArguments = @{
+    ConfigPath = $ConfigPath
+}
 
-Disconnect-Graph
+if ($DryRun) {
+    $ForwardedArguments.DryRun = $true
+}
+
+if ($AllowCreate) {
+    $ForwardedArguments.AllowCreate = $true
+}
+
+if ($AllowUpdate) {
+    $ForwardedArguments.AllowUpdate = $true
+}
+
+if ($NonInteractive) {
+    $ForwardedArguments.NonInteractive = $true
+}
+
+Write-Output 'The legacy sample now delegates to src/Sync-SnipeItAzure.ps1 with safe defaults.'
+& $SyncScriptPath @ForwardedArguments
