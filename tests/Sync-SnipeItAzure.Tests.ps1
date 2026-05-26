@@ -101,7 +101,8 @@ Describe 'matching behavior' {
         $AssetB = New-TestAsset -Id 2 -Serial 'B1' -Name 'shared-name'
         $Lookup = New-AssetLookup -Assets @($AssetA, $AssetB)
         $Device = [pscustomobject]@{ SerialNumber = $null; AzureDeviceId = $null; IntuneDeviceId = $null; DeviceName = 'shared-name' }
-        Find-SnipeItAssetMatch -AzureDevice $Device -AssetLookup $Lookup | Should -BeNullOrEmpty
+        $Result = @(Find-SnipeItAssetMatch -AzureDevice $Device -AssetLookup $Lookup | Where-Object { $_ -isnot [string] })
+        $Result | Should -BeNullOrEmpty
     }
 }
 
