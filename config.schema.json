@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Snipe-IT Azure Integration Configuration",
   "type": "object",
-  "required": ["SnipeIt", "Azure", "Sync", "FieldMappings", "Logging", "Retry"],
+  "required": ["SnipeIt", "Azure", "Sync", "FieldMappings", "Logging", "Security", "Retry"],
   "additionalProperties": false,
   "properties": {
     "SnipeIt": {
@@ -66,11 +66,28 @@
     },
     "Logging": {
       "type": "object",
-      "required": ["LogPath", "ReportPath"],
+      "required": ["LogPath", "ReportPath", "EmitInformationStream"],
       "additionalProperties": false,
       "properties": {
         "LogPath": { "type": "string", "minLength": 1 },
-        "ReportPath": { "type": "string", "minLength": 1 }
+        "ReportPath": { "type": "string", "minLength": 1 },
+        "EmitInformationStream": {
+          "type": "boolean",
+          "description": "When true, structured JSON log lines are also written to the PowerShell information stream. File logging is always used."
+        }
+      }
+    },
+    "Security": {
+      "type": "object",
+      "required": ["AllowedWindowsPrincipals"],
+      "additionalProperties": false,
+      "properties": {
+        "AllowedWindowsPrincipals": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 },
+          "uniqueItems": true,
+          "description": "Additional Windows principals allowed on config, log, and report ACLs. SYSTEM, local Administrators, and the current process identity are always allowed."
+        }
       }
     },
     "Retry": {
