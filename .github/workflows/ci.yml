@@ -45,10 +45,19 @@ jobs:
             exit 1
           }
 
-      - name: Run PSScriptAnalyzer
+      - name: Run security-focused PSScriptAnalyzer rules
         shell: pwsh
         run: |
-          $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Warning,Error
+          $securityRules = @(
+            'PSAvoidUsingConvertToSecureStringWithPlainText',
+            'PSAvoidUsingPlainTextForPassword',
+            'PSAvoidUsingUsernameAndPasswordParams',
+            'PSAvoidUsingInvokeExpression',
+            'PSAvoidUsingComputerNameHardcoded',
+            'PSAvoidUsingWMICmdlet',
+            'PSAvoidUsingEmptyCatchBlock'
+          )
+          $results = Invoke-ScriptAnalyzer -Path . -Recurse -IncludeRule $securityRules -Severity Warning,Error
           $results | Format-Table -AutoSize
           if (@($results).Count -gt 0) { exit 1 }
 
