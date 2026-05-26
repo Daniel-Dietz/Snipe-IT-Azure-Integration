@@ -120,7 +120,7 @@ Describe 'module behavior' {
             $Resolved | Should -Be ([System.IO.Path]::GetFullPath($Target))
             Test-Path -LiteralPath (Split-Path -Parent $Target) | Should -BeTrue
         } -ArgumentList $TestDrive
-        Should -Invoke -CommandName Assert-SafeExistingPathSegment -ModuleName SnipeItAzureSync -AtLeast 1
+        Should -Invoke -CommandName Assert-SafeExistingPathSegment -ModuleName SnipeItAzureSync -Times 1
     }
 
     It 'normalizes serial values before duplicate detection' {
