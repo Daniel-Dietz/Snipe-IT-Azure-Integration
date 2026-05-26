@@ -1,19 +1,22 @@
 #requires -Version 7.2
 <#!
 .SYNOPSIS
-Synchronizes Microsoft Entra ID / Intune device inventory into Snipe-IT.
+Synchronizes Microsoft Intune managed device inventory into Snipe-IT.
 
 .DESCRIPTION
-This script is built with conservative production defaults: no embedded secrets, dry-run support,
-non-destructive behavior unless explicitly enabled, structured logging, pagination, retry handling,
-redaction, duplicate detection, and clear exit codes for automation.
+Runs in plan-only mode by default. Apply mode requires explicit create/update switches. Secrets are read
+through a single sanitized runtime configuration path and are never accepted from the JSON configuration file.
 #>
 
-[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+[CmdletBinding()]
 param(
     [Parameter()]
     [ValidateNotNullOrEmpty()]
     [string]$ConfigPath = '.\config.json',
+
+    [Parameter()]
+    [ValidateSet('Plan', 'Apply')]
+    [string]$Mode,
 
     [Parameter()]
     [switch]$DryRun,
@@ -25,84 +28,87 @@ param(
     [switch]$AllowUpdate,
 
     [Parameter()]
-    [switch]$AllowArchive,
-
-    [Parameter()]
-    [switch]$AllowDelete,
-
-    [Parameter()]
-    [switch]$IUnderstandThisCanRemoveAssets,
+    [switch]$NonInteractive,
 
     [Parameter()]
     [ValidateSet('Debug', 'Info', 'Warning', 'Error')]
-    [string]$LogLevel = 'Info',
-
-    [Parameter()]
-    [switch]$NonInteractive
+    [string]$LogLevel = 'Info'
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $ExitCodes = [ordered]@{
-    Success                  = 0
-    GeneralFailure           = 1
-    ConfigurationError       = 2
-    AuthenticationFailure    = 3
-    ApiConnectivityFailure   = 4
-    ValidationFailure        = 5
-    PartialSyncFailure       = 6
-    DestructiveActionBlocked = 7
+    Success                = 0
+    GeneralFailure         = 1
+    ConfigurationError     = 2
+    AuthenticationFailure  = 3
+    ApiConnectivityFailure = 4
+    ValidationFailure      = 5
+    PartialSyncFailure     = 6
 }
 
+$AllowedDeviceFields = @('SerialNumber', 'DeviceName', 'Manufacturer', 'Model', 'AzureDeviceId', 'IntuneDeviceId', 'AssignedUser')
+$AllowedMatchFields = @('SerialNumber', 'AzureDeviceId', 'IntuneDeviceId', 'DeviceName')
 $Script:CorrelationId = [guid]::NewGuid().ToString()
-$Script:Config = $null
+$Script:Runtime = $null
 $Script:Summary = [ordered]@{
-    CorrelationId       = $Script:CorrelationId
-    StartedAt           = (Get-Date).ToUniversalTime().ToString('o')
-    FinishedAt          = $null
-    DryRun              = [bool]$DryRun
-    AzureDevicesRead    = 0
-    SnipeItAssetsRead   = 0
-    Created             = 0
-    Updated             = 0
-    Skipped             = 0
-    Archived            = 0
-    Deleted             = 0
-    Failed              = 0
-    Warnings            = 0
-    Errors              = @()
+    CorrelationId     = $Script:CorrelationId
+    StartedAt         = (Get-Date).ToUniversalTime().ToString('o')
+    FinishedAt        = $null
+    Mode              = 'Plan'
+    AzureDevicesRead  = 0
+    SnipeItAssetsRead = 0
+    WouldCreate       = 0
+    Created           = 0
+    WouldUpdate       = 0
+    Updated           = 0
+    Skipped           = 0
+    Failed            = 0
+    Warnings          = 0
+    Errors            = @()
 }
 
-function ConvertTo-SafeLogValue {
+function ConvertTo-RedactedValue {
     [CmdletBinding()]
     param([AllowNull()][object]$Value)
 
     if ($null -eq $Value) { return $null }
-    $Text = [string]$Value
-    if ([string]::IsNullOrWhiteSpace($Text)) { return $Text }
-    if ($Text -match '(?i)(bearer\s+|token|secret|password|authorization|client_secret|apikey|api_key)') { return '***REDACTED***' }
-    if ($Text.Length -gt 24 -and $Text -match '^[A-Za-z0-9_\-\.~+/=]+$') { return "$($Text.Substring(0,4))...$($Text.Substring($Text.Length - 4))" }
-    return $Text
-}
 
-function ConvertTo-SafeLogObject {
-    [CmdletBinding()]
-    param([AllowNull()][object]$InputObject)
-
-    if ($null -eq $InputObject) { return $null }
-    if ($InputObject -is [string] -or $InputObject.GetType().IsPrimitive) { return ConvertTo-SafeLogValue -Value $InputObject }
-
-    $Safe = [ordered]@{}
-    foreach ($Property in $InputObject.PSObject.Properties) {
-        if ($Property.Name -match '(?i)(token|secret|password|authorization|clientsecret|apikey|api_key)') {
-            $Safe[$Property.Name] = '***REDACTED***'
+    if ($Value -is [System.Collections.IDictionary]) {
+        $Result = [ordered]@{}
+        foreach ($Key in $Value.Keys) {
+            if ([string]$Key -match '(?i)(token|secret|password|authorization|credential|thumbprint)') {
+                $Result[$Key] = '***REDACTED***'
+            }
+            else {
+                $Result[$Key] = ConvertTo-RedactedValue -Value $Value[$Key]
+            }
         }
-        else {
-            $Safe[$Property.Name] = ConvertTo-SafeLogValue -Value $Property.Value
-        }
+        return $Result
     }
-    return $Safe
+
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        return @($Value | ForEach-Object { ConvertTo-RedactedValue -Value $_ })
+    }
+
+    if ($Value -is [pscustomobject]) {
+        $Result = [ordered]@{}
+        foreach ($Property in $Value.PSObject.Properties) {
+            if ($Property.Name -match '(?i)(token|secret|password|authorization|credential|thumbprint)') {
+                $Result[$Property.Name] = '***REDACTED***'
+            }
+            else {
+                $Result[$Property.Name] = ConvertTo-RedactedValue -Value $Property.Value
+            }
+        }
+        return $Result
+    }
+
+    $Text = [string]$Value
+    if ($Text -match '(?i)(bearer\s+|client_secret|api[_-]?key|token|password|authorization)') { return '***REDACTED***' }
+    if ($Text.Length -gt 32 -and $Text -match '^[A-Za-z0-9_\-\.~+/=]+$') { return "$($Text.Substring(0,4))...$($Text.Substring($Text.Length - 4))" }
+    return $Value
 }
 
 function Write-SyncLog {
@@ -128,42 +134,39 @@ function Write-SyncLog {
         Level         = $Level
         CorrelationId = $Script:CorrelationId
         Message       = $Message
-        Data          = if ($Data) { ConvertTo-SafeLogObject -InputObject ([pscustomobject]$Data) } else { $null }
+        Data          = if ($Data) { ConvertTo-RedactedValue -Value $Data } else { $null }
     }
 
-    $Line = $Entry | ConvertTo-Json -Depth 8 -Compress
-    Write-Host $Line
+    $Line = $Entry | ConvertTo-Json -Depth 12 -Compress
+    Write-Output $Line
 
-    if ($Script:Config -and $Script:Config.Logging.LogPath) {
-        $LogDirectory = Split-Path -Parent $Script:Config.Logging.LogPath
+    if ($Script:Runtime -and $Script:Runtime.Config.Logging.LogPath) {
+        $LogDirectory = Split-Path -Parent $Script:Runtime.Config.Logging.LogPath
         if ($LogDirectory -and -not (Test-Path -LiteralPath $LogDirectory)) {
             New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
         }
-        Add-Content -LiteralPath $Script:Config.Logging.LogPath -Value $Line -Encoding UTF8
+        Add-Content -LiteralPath $Script:Runtime.Config.Logging.LogPath -Value $Line -Encoding UTF8
     }
 }
 
-function Get-RequiredEnvironmentValue {
+function Get-EnvironmentSecret {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$Name,
 
         [Parameter(Mandatory)]
+        [ValidateNotNullOrEmpty()]
         [string]$Purpose
     )
 
-    $Value = [Environment]::GetEnvironmentVariable($Name, 'Process')
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        $Value = [Environment]::GetEnvironmentVariable($Name, 'User')
+    foreach ($Scope in 'Process', 'User', 'Machine') {
+        $Value = [Environment]::GetEnvironmentVariable($Name, $Scope)
+        if (-not [string]::IsNullOrWhiteSpace($Value)) { return $Value }
     }
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        $Value = [Environment]::GetEnvironmentVariable($Name, 'Machine')
-    }
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        throw "Required environment variable '$Name' for $Purpose is missing."
-    }
-    return $Value
+
+    throw "Required secret source for $Purpose is missing. Set environment variable '$Name' in the runtime context."
 }
 
 function Read-SyncConfig {
@@ -171,41 +174,67 @@ function Read-SyncConfig {
     param([Parameter(Mandatory)][string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        throw "Configuration file '$Path' was not found. Copy config.example.json to config.json first."
+        throw "Configuration file '$Path' was not found. Copy config.example.json to config.json and configure environment variable names."
     }
 
-    $Raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
-    $Config = $Raw | ConvertFrom-Json -Depth 20
+    $Config = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -Depth 20
 
-    if (-not $Config.SnipeIt.BaseUrl.StartsWith('https://', [StringComparison]::OrdinalIgnoreCase) -and -not $Config.SnipeIt.AllowInsecureTls) {
-        throw 'Snipe-IT BaseUrl must use https:// unless AllowInsecureTls is explicitly true.'
+    if (-not $Config.SnipeIt.BaseUrl.StartsWith('https://', [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Snipe-IT BaseUrl must use HTTPS. HTTP is not supported by this production script.'
     }
 
-    if ($AllowDelete -and -not $IUnderstandThisCanRemoveAssets) {
-        throw 'Deletion requested without -IUnderstandThisCanRemoveAssets.'
+    if ($Config.Azure.Source -ne 'IntuneManagedDevices') {
+        throw "Unsupported Azure source '$($Config.Azure.Source)'. Only IntuneManagedDevices is supported because Entra device objects do not reliably contain serial numbers."
     }
 
-    if ($Config.Sync.MissingAzureDeviceAction -eq 'Delete' -and (-not $AllowDelete -or -not $IUnderstandThisCanRemoveAssets)) {
-        throw 'Config requests Delete for missing Azure devices, but destructive delete switches are not both present.'
+    foreach ($Field in @($Config.Sync.MatchPriority)) {
+        if ($AllowedMatchFields -notcontains [string]$Field) { throw "Unsupported match field '$Field'." }
+    }
+
+    foreach ($Field in @($Config.Sync.UpdateFields + $Config.Sync.CreateFields)) {
+        if ($AllowedDeviceFields -notcontains [string]$Field) { throw "Unsupported sync field '$Field'." }
+        if (-not $Config.FieldMappings.PSObject.Properties.Name.Contains([string]$Field)) { throw "Field '$Field' is enabled but has no FieldMappings entry." }
     }
 
     return $Config
 }
 
+function New-RuntimeContext {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Config)
+
+    $EffectiveMode = if ($DryRun) { 'Plan' } elseif ($Mode) { $Mode } elseif ($Config.Sync.Mode) { [string]$Config.Sync.Mode } else { 'Plan' }
+    if ($EffectiveMode -eq 'Apply' -and -not ($AllowCreate -or $AllowUpdate)) {
+        throw 'Apply mode requires at least one explicit write switch: -AllowCreate or -AllowUpdate.'
+    }
+
+    $Context = [pscustomobject]@{
+        Config                 = $Config
+        Mode                   = $EffectiveMode
+        SnipeItApiToken        = Get-EnvironmentSecret -Name $Config.SnipeIt.ApiTokenEnvironmentVariable -Purpose 'Snipe-IT API token'
+        AzureTenantId          = Get-EnvironmentSecret -Name $Config.Azure.TenantIdEnvironmentVariable -Purpose 'Azure tenant ID'
+        AzureClientId          = Get-EnvironmentSecret -Name $Config.Azure.ClientIdEnvironmentVariable -Purpose 'Azure client ID'
+        AzureCertThumbprint    = Get-EnvironmentSecret -Name $Config.Azure.CertificateThumbprintEnvironmentVariable -Purpose 'Azure certificate thumbprint'
+        AllowCreate            = [bool]$AllowCreate
+        AllowUpdate            = [bool]$AllowUpdate
+        NonInteractive         = [bool]$NonInteractive
+    }
+
+    $Script:Summary.Mode = $EffectiveMode
+    return $Context
+}
+
 function Invoke-RetryRequest {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)]
-        [scriptblock]$Operation,
-
-        [Parameter(Mandatory)]
-        [string]$OperationName
+        [Parameter(Mandatory)][scriptblock]$Operation,
+        [Parameter(Mandatory)][string]$OperationName
     )
 
     $Attempt = 0
-    $Delay = [int]$Script:Config.Retry.InitialDelaySeconds
-    $MaxAttempts = [int]$Script:Config.Retry.MaxAttempts
-    $MaxDelay = [int]$Script:Config.Retry.MaxDelaySeconds
+    $Delay = [int]$Script:Runtime.Config.Retry.InitialDelaySeconds
+    $MaxAttempts = [int]$Script:Runtime.Config.Retry.MaxAttempts
+    $MaxDelay = [int]$Script:Runtime.Config.Retry.MaxDelaySeconds
 
     while ($true) {
         $Attempt++
@@ -214,47 +243,50 @@ function Invoke-RetryRequest {
         }
         catch {
             $StatusCode = $null
+            $RetryAfter = $null
             if ($_.Exception.Response -and $_.Exception.Response.StatusCode) {
                 $StatusCode = [int]$_.Exception.Response.StatusCode
+                if ($_.Exception.Response.Headers -and $_.Exception.Response.Headers['Retry-After']) {
+                    [int]::TryParse([string]$_.Exception.Response.Headers['Retry-After'], [ref]$RetryAfter) | Out-Null
+                }
             }
 
             $Transient = $StatusCode -in @(408, 429, 500, 502, 503, 504)
             if (-not $Transient -or $Attempt -ge $MaxAttempts) {
-                Write-SyncLog -Level Error -Message "API operation failed." -Data @{ Operation = $OperationName; Attempt = $Attempt; StatusCode = $StatusCode; Error = $_.Exception.Message }
+                Write-SyncLog -Level Error -Message 'API operation failed.' -Data @{ Operation = $OperationName; Attempt = $Attempt; StatusCode = $StatusCode }
                 throw
             }
 
-            Write-SyncLog -Level Warning -Message "Transient API failure; retrying." -Data @{ Operation = $OperationName; Attempt = $Attempt; StatusCode = $StatusCode; DelaySeconds = $Delay }
-            Start-Sleep -Seconds $Delay
+            $SleepSeconds = if ($RetryAfter -and $RetryAfter -gt 0) { [Math]::Min($RetryAfter, $MaxDelay) } else { $Delay }
+            Write-SyncLog -Level Warning -Message 'Transient API failure; retrying.' -Data @{ Operation = $OperationName; Attempt = $Attempt; StatusCode = $StatusCode; DelaySeconds = $SleepSeconds }
+            Start-Sleep -Seconds $SleepSeconds
             $Delay = [Math]::Min($Delay * 2, $MaxDelay)
         }
     }
 }
 
-function Get-GraphAccessToken {
+function Connect-GraphSafe {
     [CmdletBinding()]
     param()
 
-    $TenantId = Get-RequiredEnvironmentValue -Name $Script:Config.Azure.TenantIdEnvironmentVariable -Purpose 'Azure tenant ID'
-    $ClientId = Get-RequiredEnvironmentValue -Name $Script:Config.Azure.ClientIdEnvironmentVariable -Purpose 'Azure client ID'
-    $Thumbprint = Get-RequiredEnvironmentValue -Name $Script:Config.Azure.CertificateThumbprintEnvironmentVariable -Purpose 'Azure certificate thumbprint'
-
     if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Authentication)) {
-        throw 'Microsoft.Graph.Authentication module is required. Install it with: Install-Module Microsoft.Graph.Authentication -Scope CurrentUser'
+        throw 'Microsoft.Graph.Authentication module is required. Install it before running the sync.'
     }
 
+    $Certificate = Get-ChildItem -Path Cert:\CurrentUser\My, Cert:\LocalMachine\My -ErrorAction SilentlyContinue | Where-Object { $_.Thumbprint -eq $Script:Runtime.AzureCertThumbprint } | Select-Object -First 1
+    if (-not $Certificate) { throw 'Configured Azure certificate thumbprint was not found in CurrentUser or LocalMachine certificate store.' }
+    if ($Certificate.NotAfter -lt (Get-Date).AddDays(14)) { throw 'Configured Azure certificate expires within 14 days or is already expired.' }
+
     Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-    Connect-MgGraph -TenantId $TenantId -ClientId $ClientId -CertificateThumbprint $Thumbprint -NoWelcome | Out-Null
-    $Context = Get-MgContext
-    if (-not $Context) { throw 'Microsoft Graph authentication failed.' }
-    return $true
+    Connect-MgGraph -TenantId $Script:Runtime.AzureTenantId -ClientId $Script:Runtime.AzureClientId -CertificateThumbprint $Script:Runtime.AzureCertThumbprint -NoWelcome | Out-Null
+    if (-not (Get-MgContext)) { throw 'Microsoft Graph authentication failed.' }
 }
 
-function Invoke-GraphGetAllPages {
+function Invoke-GraphGetAllPage {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Uri)
 
-    $Items = New-Object System.Collections.Generic.List[object]
+    $Items = [System.Collections.Generic.List[object]]::new()
     $NextUri = $Uri
     while ($NextUri) {
         $Response = Invoke-RetryRequest -OperationName 'Microsoft Graph GET' -Operation {
@@ -266,18 +298,12 @@ function Invoke-GraphGetAllPages {
     return $Items
 }
 
-function Get-AzureDevices {
+function Get-AzureDevice {
     [CmdletBinding()]
     param()
 
-    if ($Script:Config.Azure.Source -eq 'IntuneManagedDevices') {
-        $Uri = 'https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$select=id,azureADDeviceId,deviceName,serialNumber,manufacturer,model,userPrincipalName,operatingSystem,lastSyncDateTime'
-    }
-    else {
-        $Uri = 'https://graph.microsoft.com/v1.0/devices?$select=id,displayName,deviceId,manufacturer,model,operatingSystem,approximateLastSignInDateTime'
-    }
-
-    $Devices = Invoke-GraphGetAllPages -Uri $Uri
+    $Uri = 'https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$select=id,azureADDeviceId,deviceName,serialNumber,manufacturer,model,userPrincipalName,operatingSystem,lastSyncDateTime'
+    $Devices = Invoke-GraphGetAllPage -Uri $Uri
     $Script:Summary.AzureDevicesRead = $Devices.Count
     return $Devices
 }
@@ -285,22 +311,20 @@ function Get-AzureDevices {
 function Invoke-SnipeItRequest {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][ValidateSet('GET', 'POST', 'PATCH', 'PUT', 'DELETE')][string]$Method,
+        [Parameter(Mandatory)][ValidateSet('GET', 'POST', 'PATCH')][string]$Method,
         [Parameter(Mandatory)][string]$Path,
         [Parameter()][object]$Body
     )
 
-    $Token = Get-RequiredEnvironmentValue -Name $Script:Config.SnipeIt.ApiTokenEnvironmentVariable -Purpose 'Snipe-IT API token'
-    $BaseUrl = $Script:Config.SnipeIt.BaseUrl.TrimEnd('/')
-    $Uri = if ($Path.StartsWith('http', [StringComparison]::OrdinalIgnoreCase)) { $Path } else { "$BaseUrl/api/v1/$($Path.TrimStart('/'))" }
-
+    $BaseUrl = $Script:Runtime.Config.SnipeIt.BaseUrl.TrimEnd('/')
+    $Uri = "$BaseUrl/api/v1/$($Path.TrimStart('/'))"
     $Headers = @{
-        Authorization = "Bearer $Token"
+        Authorization = "Bearer $($Script:Runtime.SnipeItApiToken)"
         Accept        = 'application/json'
     }
 
     Invoke-RetryRequest -OperationName "Snipe-IT $Method $Path" -Operation {
-        if ($Body) {
+        if ($PSBoundParameters.ContainsKey('Body')) {
             Invoke-RestMethod -Method $Method -Uri $Uri -Headers $Headers -Body ($Body | ConvertTo-Json -Depth 20) -ContentType 'application/json' -TimeoutSec 60
         }
         else {
@@ -309,12 +333,25 @@ function Invoke-SnipeItRequest {
     }
 }
 
-function Get-SnipeItAssets {
+function Assert-SnipeItResponse {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Response,
+        [Parameter(Mandatory)][string]$Operation
+    )
+
+    if ($Response.PSObject.Properties.Name -contains 'status' -and [string]$Response.status -notin @('success', 'ok')) {
+        $Message = if ($Response.PSObject.Properties.Name -contains 'messages') { ConvertTo-Json -InputObject (ConvertTo-RedactedValue -Value $Response.messages) -Compress } else { 'No Snipe-IT validation details returned.' }
+        throw "Snipe-IT $Operation failed validation: $Message"
+    }
+}
+
+function Get-SnipeItAsset {
     [CmdletBinding()]
     param()
 
-    $All = New-Object System.Collections.Generic.List[object]
-    $Limit = [int]$Script:Config.SnipeIt.PageSize
+    $All = [System.Collections.Generic.List[object]]::new()
+    $Limit = [int]$Script:Runtime.Config.SnipeIt.PageSize
     $Offset = 0
 
     while ($true) {
@@ -333,7 +370,7 @@ function Test-BadSerialNumber {
     param([AllowNull()][string]$SerialNumber)
 
     if ([string]::IsNullOrWhiteSpace($SerialNumber)) { return $true }
-    foreach ($BadSerial in @($Script:Config.Sync.BadSerialNumbers)) {
+    foreach ($BadSerial in @($Script:Runtime.Config.Sync.BadSerialNumbers)) {
         if ($SerialNumber.Trim().Equals([string]$BadSerial, [StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
     return $false
@@ -343,28 +380,15 @@ function ConvertTo-NormalizedAzureDevice {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Device)
 
-    if ($Script:Config.Azure.Source -eq 'IntuneManagedDevices') {
-        return [pscustomobject]@{
-            SourceId       = $Device.id
-            AzureDeviceId  = $Device.azureADDeviceId
-            IntuneDeviceId = $Device.id
-            DeviceName     = $Device.deviceName
-            SerialNumber   = $Device.serialNumber
-            Manufacturer   = $Device.manufacturer
-            Model          = $Device.model
-            AssignedUser   = $Device.userPrincipalName
-        }
-    }
-
-    return [pscustomobject]@{
+    [pscustomobject]@{
         SourceId       = $Device.id
-        AzureDeviceId  = $Device.deviceId
-        IntuneDeviceId = $null
-        DeviceName     = $Device.displayName
-        SerialNumber   = $null
+        AzureDeviceId  = $Device.azureADDeviceId
+        IntuneDeviceId = $Device.id
+        DeviceName     = $Device.deviceName
+        SerialNumber   = $Device.serialNumber
         Manufacturer   = $Device.manufacturer
         Model          = $Device.model
-        AssignedUser   = $null
+        AssignedUser   = $Device.userPrincipalName
     }
 }
 
@@ -375,45 +399,86 @@ function Get-SnipeAssetFieldValue {
         [Parameter(Mandatory)][string]$LogicalField
     )
 
-    $Mapped = $Script:Config.FieldMappings.$LogicalField
+    $Mapped = $Script:Runtime.Config.FieldMappings.$LogicalField
     if (-not $Mapped) { return $null }
-
     if ($Asset.PSObject.Properties.Name -contains $Mapped) { return $Asset.$Mapped }
     if ($Asset.custom_fields -and $Asset.custom_fields.PSObject.Properties.Name -contains $Mapped) { return $Asset.custom_fields.$Mapped.value }
     return $null
+}
+
+function Add-UniqueLookupValue {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Lookup,
+        [Parameter(Mandatory)][string]$KeyName,
+        [AllowNull()][string]$KeyValue,
+        [Parameter(Mandatory)][object]$Item,
+        [Parameter(Mandatory)][string]$SourceName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($KeyValue)) { return }
+    if ($KeyName -eq 'SerialNumber' -and (Test-BadSerialNumber -SerialNumber $KeyValue)) { return }
+    $NormalizedKey = $KeyValue.Trim().ToUpperInvariant()
+    if (-not $Lookup.ContainsKey($KeyName)) { $Lookup[$KeyName] = @{} }
+    if ($Lookup[$KeyName].ContainsKey($NormalizedKey)) { throw "Duplicate $SourceName value detected for $KeyName. Resolve duplicates before syncing." }
+    $Lookup[$KeyName][$NormalizedKey] = $Item
+}
+
+function New-AssetLookup {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object[]]$Assets)
+
+    $Lookup = @{}
+    foreach ($Asset in $Assets) {
+        foreach ($KeyName in @($Script:Runtime.Config.Sync.MatchPriority)) {
+            Add-UniqueLookupValue -Lookup $Lookup -KeyName $KeyName -KeyValue ([string](Get-SnipeAssetFieldValue -Asset $Asset -LogicalField $KeyName)) -Item $Asset -SourceName 'Snipe-IT asset'
+        }
+    }
+    return $Lookup
+}
+
+function Test-AzureDuplicateKey {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object[]]$Devices)
+
+    $Lookup = @{}
+    foreach ($Device in $Devices) {
+        foreach ($KeyName in @($Script:Runtime.Config.Sync.MatchPriority)) {
+            Add-UniqueLookupValue -Lookup $Lookup -KeyName $KeyName -KeyValue ([string]$Device.$KeyName) -Item $Device -SourceName 'Azure device'
+        }
+    }
 }
 
 function Find-SnipeItAssetMatch {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$AzureDevice,
-        [Parameter(Mandatory)][object[]]$SnipeAssets
+        [Parameter(Mandatory)][hashtable]$AssetLookup
     )
 
-    foreach ($Key in @($Script:Config.Sync.MatchPriority)) {
-        $Value = $AzureDevice.$Key
-        if ([string]::IsNullOrWhiteSpace([string]$Value)) { continue }
-        if ($Key -eq 'SerialNumber' -and (Test-BadSerialNumber -SerialNumber $Value)) { continue }
-
-        $Matches = @($SnipeAssets | Where-Object { [string](Get-SnipeAssetFieldValue -Asset $_ -LogicalField $Key) -eq [string]$Value })
-        if ($Matches.Count -gt 1) {
-            throw "Ambiguous Snipe-IT match for $Key '$Value': $($Matches.Count) assets matched."
-        }
-        if ($Matches.Count -eq 1) {
-            return [pscustomobject]@{ Asset = $Matches[0]; MatchKey = $Key; MatchValue = $Value }
+    foreach ($KeyName in @($Script:Runtime.Config.Sync.MatchPriority)) {
+        $Value = [string]$AzureDevice.$KeyName
+        if ([string]::IsNullOrWhiteSpace($Value)) { continue }
+        if ($KeyName -eq 'SerialNumber' -and (Test-BadSerialNumber -SerialNumber $Value)) { continue }
+        $NormalizedKey = $Value.Trim().ToUpperInvariant()
+        if ($AssetLookup.ContainsKey($KeyName) -and $AssetLookup[$KeyName].ContainsKey($NormalizedKey)) {
+            return [pscustomobject]@{ Asset = $AssetLookup[$KeyName][$NormalizedKey]; MatchKey = $KeyName; MatchValue = $Value }
         }
     }
-
     return $null
 }
 
 function New-SnipeItPayload {
     [CmdletBinding()]
-    param([Parameter(Mandatory)][object]$AzureDevice)
+    param(
+        [Parameter(Mandatory)][object]$AzureDevice,
+        [Parameter(Mandatory)][ValidateSet('Create', 'Update')][string]$Operation
+    )
 
+    $AllowedFields = if ($Operation -eq 'Create') { @($Script:Runtime.Config.Sync.CreateFields) } else { @($Script:Runtime.Config.Sync.UpdateFields) }
     $Payload = [ordered]@{}
-    foreach ($LogicalField in $Script:Config.FieldMappings.PSObject.Properties.Name) {
-        $MappedName = $Script:Config.FieldMappings.$LogicalField
+    foreach ($LogicalField in $AllowedFields) {
+        $MappedName = $Script:Runtime.Config.FieldMappings.$LogicalField
         $Value = $AzureDevice.$LogicalField
         if ($null -ne $Value -and -not [string]::IsNullOrWhiteSpace([string]$Value)) {
             $Payload[$MappedName] = $Value
@@ -443,9 +508,11 @@ function Invoke-Sync {
     [CmdletBinding()]
     param()
 
-    Get-GraphAccessToken | Out-Null
-    $AzureDevices = @(Get-AzureDevices | ForEach-Object { ConvertTo-NormalizedAzureDevice -Device $_ })
-    $SnipeAssets = @(Get-SnipeItAssets)
+    Connect-GraphSafe
+    $AzureDevices = @(Get-AzureDevice | ForEach-Object { ConvertTo-NormalizedAzureDevice -Device $_ })
+    Test-AzureDuplicateKey -Devices $AzureDevices
+    $SnipeAssets = @(Get-SnipeItAsset)
+    $AssetLookup = New-AssetLookup -Assets $SnipeAssets
 
     foreach ($Device in $AzureDevices) {
         try {
@@ -455,24 +522,28 @@ function Invoke-Sync {
                 continue
             }
 
-            $Match = Find-SnipeItAssetMatch -AzureDevice $Device -SnipeAssets $SnipeAssets
-            $Payload = New-SnipeItPayload -AzureDevice $Device
-
+            $Match = Find-SnipeItAssetMatch -AzureDevice $Device -AssetLookup $AssetLookup
             if ($null -eq $Match) {
-                if (-not $AllowCreate) {
+                $Payload = New-SnipeItPayload -AzureDevice $Device -Operation Create
+                if (-not $Script:Runtime.AllowCreate) {
                     Write-SyncLog -Level Info -Message 'Create skipped because -AllowCreate is not set.' -Data @{ DeviceName = $Device.DeviceName; SerialNumber = $Device.SerialNumber }
                     $Script:Summary.Skipped++
                     continue
                 }
 
-                Write-SyncLog -Level Info -Message 'Snipe-IT asset would be created.' -Data @{ DeviceName = $Device.DeviceName; SerialNumber = $Device.SerialNumber; Payload = ($Payload | ConvertTo-Json -Depth 10) }
-                if (-not $DryRun -and $PSCmdlet.ShouldProcess($Device.DeviceName, 'Create Snipe-IT asset')) {
-                    Invoke-SnipeItRequest -Method POST -Path 'hardware' -Body $Payload | Out-Null
+                if ($Script:Runtime.Mode -eq 'Plan') {
+                    Write-SyncLog -Level Info -Message 'Snipe-IT asset would be created.' -Data @{ DeviceName = $Device.DeviceName; SerialNumber = $Device.SerialNumber; Payload = $Payload }
+                    $Script:Summary.WouldCreate++
+                    continue
                 }
+
+                $Response = Invoke-SnipeItRequest -Method POST -Path 'hardware' -Body $Payload
+                Assert-SnipeItResponse -Response $Response -Operation 'create asset'
                 $Script:Summary.Created++
                 continue
             }
 
+            $Payload = New-SnipeItPayload -AzureDevice $Device -Operation Update
             $Changes = Compare-SnipeItPayload -Asset $Match.Asset -Payload $Payload
             if ($Changes.Count -eq 0) {
                 Write-SyncLog -Level Debug -Message 'Asset already up to date.' -Data @{ DeviceName = $Device.DeviceName; MatchKey = $Match.MatchKey; MatchValue = $Match.MatchValue }
@@ -480,21 +551,25 @@ function Invoke-Sync {
                 continue
             }
 
-            if (-not $AllowUpdate) {
-                Write-SyncLog -Level Info -Message 'Update skipped because -AllowUpdate is not set.' -Data @{ DeviceName = $Device.DeviceName; Changes = ($Changes | ConvertTo-Json -Depth 10) }
+            if (-not $Script:Runtime.AllowUpdate) {
+                Write-SyncLog -Level Info -Message 'Update skipped because -AllowUpdate is not set.' -Data @{ DeviceName = $Device.DeviceName; Changes = $Changes }
                 $Script:Summary.Skipped++
                 continue
             }
 
-            Write-SyncLog -Level Info -Message 'Snipe-IT asset would be updated.' -Data @{ DeviceName = $Device.DeviceName; AssetId = $Match.Asset.id; Changes = ($Changes | ConvertTo-Json -Depth 10) }
-            if (-not $DryRun -and $PSCmdlet.ShouldProcess($Device.DeviceName, 'Update Snipe-IT asset')) {
-                Invoke-SnipeItRequest -Method PATCH -Path "hardware/$($Match.Asset.id)" -Body $Payload | Out-Null
+            if ($Script:Runtime.Mode -eq 'Plan') {
+                Write-SyncLog -Level Info -Message 'Snipe-IT asset would be updated.' -Data @{ DeviceName = $Device.DeviceName; AssetId = $Match.Asset.id; Changes = $Changes }
+                $Script:Summary.WouldUpdate++
+                continue
             }
+
+            $Response = Invoke-SnipeItRequest -Method PATCH -Path "hardware/$($Match.Asset.id)" -Body $Payload
+            Assert-SnipeItResponse -Response $Response -Operation 'update asset'
             $Script:Summary.Updated++
         }
         catch {
             $Script:Summary.Failed++
-            $Script:Summary.Errors += $_.Exception.Message
+            $Script:Summary.Errors += 'A device failed to sync. Review sanitized logs with the correlation ID.'
             Write-SyncLog -Level Error -Message 'Device sync failed.' -Data @{ DeviceName = $Device.DeviceName; Error = $_.Exception.Message }
         }
     }
@@ -505,34 +580,34 @@ function Write-SyncReport {
     param()
 
     $Script:Summary.FinishedAt = (Get-Date).ToUniversalTime().ToString('o')
-    if ($Script:Config -and $Script:Config.Logging.ReportPath) {
-        $ReportDirectory = Split-Path -Parent $Script:Config.Logging.ReportPath
+    if ($Script:Runtime -and $Script:Runtime.Config.Logging.ReportPath) {
+        $ReportDirectory = Split-Path -Parent $Script:Runtime.Config.Logging.ReportPath
         if ($ReportDirectory -and -not (Test-Path -LiteralPath $ReportDirectory)) {
             New-Item -ItemType Directory -Path $ReportDirectory -Force | Out-Null
         }
-        $Script:Summary | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $Script:Config.Logging.ReportPath -Encoding UTF8
+        ConvertTo-RedactedValue -Value $Script:Summary | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $Script:Runtime.Config.Logging.ReportPath -Encoding UTF8
     }
-    Write-Output ($Script:Summary | ConvertTo-Json -Depth 10)
+    Write-Output ($Script:Summary | ConvertTo-Json -Depth 12)
 }
 
 try {
-    $Script:Config = Read-SyncConfig -Path $ConfigPath
-    Write-SyncLog -Level Info -Message 'Starting Snipe-IT Azure synchronization.' -Data @{ DryRun = [bool]$DryRun; AllowCreate = [bool]$AllowCreate; AllowUpdate = [bool]$AllowUpdate; AllowArchive = [bool]$AllowArchive; AllowDelete = [bool]$AllowDelete }
+    $Config = Read-SyncConfig -Path $ConfigPath
+    $Script:Runtime = New-RuntimeContext -Config $Config
+    Write-SyncLog -Level Info -Message 'Starting Snipe-IT Azure synchronization.' -Data @{ Mode = $Script:Runtime.Mode; AllowCreate = $Script:Runtime.AllowCreate; AllowUpdate = $Script:Runtime.AllowUpdate; NonInteractive = $Script:Runtime.NonInteractive }
     Invoke-Sync
     Write-SyncReport
     if ($Script:Summary.Failed -gt 0) { exit $ExitCodes.PartialSyncFailure }
     exit $ExitCodes.Success
 }
 catch {
-    $Message = $_.Exception.Message
-    $Script:Summary.Errors += $Message
-    if ($Script:Config) { Write-SyncLog -Level Error -Message 'Synchronization failed.' -Data @{ Error = $Message } }
-    else { Write-Error $Message }
+    $SafeMessage = $_.Exception.Message
+    $Script:Summary.Errors += $SafeMessage
+    if ($Script:Runtime) { Write-SyncLog -Level Error -Message 'Synchronization failed.' -Data @{ Error = $SafeMessage } } else { Write-Error $SafeMessage }
     Write-SyncReport
 
-    if ($Message -match 'environment variable|Configuration|config|https|Deletion') { exit $ExitCodes.ConfigurationError }
-    if ($Message -match 'authentication|certificate|Connect-MgGraph') { exit $ExitCodes.AuthenticationFailure }
-    if ($Message -match 'API|HTTP|connect|timeout') { exit $ExitCodes.ApiConnectivityFailure }
-    if ($Message -match 'Delete|destructive') { exit $ExitCodes.DestructiveActionBlocked }
+    if ($SafeMessage -match 'configuration|config|unsupported|field|HTTPS|environment variable|secret source') { exit $ExitCodes.ConfigurationError }
+    if ($SafeMessage -match 'authentication|certificate|Connect-MgGraph') { exit $ExitCodes.AuthenticationFailure }
+    if ($SafeMessage -match 'API|HTTP|connect|timeout') { exit $ExitCodes.ApiConnectivityFailure }
+    if ($SafeMessage -match 'duplicate|validation|serial') { exit $ExitCodes.ValidationFailure }
     exit $ExitCodes.GeneralFailure
 }
