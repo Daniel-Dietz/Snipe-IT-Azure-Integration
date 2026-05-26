@@ -1,37 +1,38 @@
 # Snipe-IT Azure Integration
 
-Production-oriented PowerShell integration to synchronize Microsoft Entra ID / Intune device inventory into Snipe-IT with safe defaults, dry-run support, structured logging, retry handling, and explicit destructive-action guardrails.
+Production-oriented PowerShell integration to synchronize Microsoft Intune managed device inventory into Snipe-IT with safe defaults, plan/apply execution, structured logging, retry handling, and explicit write controls.
 
 ## Current safety model
 
 The script is intentionally conservative:
 
-- no secrets are stored in the repository
-- dry-run is the recommended first execution mode
-- deletion is disabled unless explicitly enabled
-- Snipe-IT asset tags are treated as Snipe-IT-owned data by default
-- ambiguous duplicate matches are blocked instead of guessed
-- transient API failures are retried with exponential backoff
-- sensitive values are redacted from logs
+- no secrets are stored in the repository or in `config.json`
+- `Plan` mode is the default and performs no Snipe-IT writes
+- writes require `Apply` mode plus `-AllowCreate` and/or `-AllowUpdate`
+- archive/delete lifecycle actions are not implemented and are not exposed
+- only Intune managed devices are supported because Entra device objects do not reliably contain serial numbers
+- Snipe-IT asset tags and procurement fields are not synchronized by default
+- duplicate Azure or Snipe-IT match keys are blocked instead of guessed
+- transient API failures are retried with exponential backoff and `Retry-After` support
+- sensitive values are recursively redacted from logs and reports
 
 ## Requirements
 
 - PowerShell 7.2 or newer
 - Network access to Snipe-IT and Microsoft Graph
 - Snipe-IT API token with the minimum required asset permissions
-- Microsoft Entra application registration using certificate authentication where possible
+- Microsoft Entra application registration using certificate authentication
+- Microsoft Graph PowerShell `Microsoft.Graph.Authentication` module
 
 ## Recommended Microsoft Graph permissions
 
-Use the least-privilege permissions required for your selected source:
+Use the least-privilege permissions required for Intune managed device inventory:
 
 | Use case | Application permission |
 |---|---|
-| Entra device inventory | `Device.Read.All` |
 | Intune managed devices | `DeviceManagementManagedDevices.Read.All` |
-| User ownership mapping | `User.Read.All` |
 
-Avoid broad write permissions such as `Directory.ReadWrite.All`, `Device.ReadWrite.All`, or `User.ReadWrite.All` unless the script is explicitly extended to write to Microsoft services.
+Avoid broad write permissions such as `Directory.ReadWrite.All`, `Device.ReadWrite.All`, or `User.ReadWrite.All`. The script writes only to Snipe-IT.
 
 ## First run
 
@@ -51,27 +52,21 @@ $env:AZURE_CLIENT_ID = '<client-id>'
 $env:AZURE_CERT_THUMBPRINT = '<certificate-thumbprint>'
 ```
 
-Run validation and dry-run:
+Run a plan-only execution first:
 
 ```powershell
-pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath .\config.json -DryRun -LogLevel Info
+pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath .\config.json -Mode Plan -LogLevel Info
 ```
 
-Only enable writes after reviewing the dry-run report:
+Only enable writes after reviewing the plan report:
 
 ```powershell
-pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath .\config.json -AllowCreate -AllowUpdate
+pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath .\config.json -Mode Apply -AllowCreate -AllowUpdate -NonInteractive
 ```
 
-## Destructive actions
+## Unsupported lifecycle actions
 
-Deletion is intentionally blocked unless both switches are present:
-
-```powershell
--AllowDelete -IUnderstandThisCanRemoveAssets
-```
-
-Prefer archiving over deletion. Default handling for Snipe-IT assets missing from Azure is `Ignore`.
+The script does **not** archive or delete Snipe-IT assets that are missing from Azure/Intune. That behavior was deliberately removed until it can be implemented with robust reconciliation and tests.
 
 ## Logs and reports
 
@@ -82,7 +77,7 @@ logs/snipeit-azure-sync.jsonl
 reports/snipeit-azure-sync-report.json
 ```
 
-Sensitive values are redacted before logging.
+Sensitive values are redacted before logging. Protect the log and report directories because they still contain operational inventory metadata such as device names and serial numbers.
 
 ## Repository layout
 
@@ -91,7 +86,7 @@ src/Sync-SnipeItAzure.ps1          Main sync script
 config.example.json                Example configuration without secrets
 config.schema.json                 JSON schema for configuration validation
 docs/runbook.md                    Operational runbook
-tests/Sync-SnipeItAzure.Tests.ps1  Pester baseline tests
+tests/Sync-SnipeItAzure.Tests.ps1  Pester safety contract tests
 .github/workflows/ci.yml           CI checks
 ```
 
@@ -106,10 +101,9 @@ tests/Sync-SnipeItAzure.Tests.ps1  Pester baseline tests
 | 4 | API connectivity failure |
 | 5 | Validation failure |
 | 6 | Partial sync failure |
-| 7 | Destructive action blocked |
 
 ## Commit message
 
 ```text
-Implement secure Snipe-IT Azure sync baseline
+Harden Snipe-IT Azure sync safety contract
 ```
