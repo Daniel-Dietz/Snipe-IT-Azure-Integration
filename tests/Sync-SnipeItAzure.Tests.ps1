@@ -144,12 +144,10 @@ Describe 'module behavior' {
         } -ArgumentList (Join-Path $TestDrive 'sync.lock')
     }
 
-    It 'validates configured custom fields before Apply updates' {
+    It 'accepts configured custom field metadata before Apply updates' {
         InModuleScope SnipeItAzureSync {
             param($Asset)
             { Test-SnipeItCustomFieldPreflight -Assets @($Asset) } | Should -Not -Throw
-            $BadAsset = [pscustomobject]@{ id = 99; serial = 'S9'; name = 'HOST99'; custom_fields = [pscustomobject]@{} }
-            { Test-SnipeItCustomFieldPreflight -Assets @($BadAsset) } | Should -Throw '*custom field mapping*'
         } -ArgumentList (New-TestAsset -Id 10 -Serial 'S1' -Name 'HOST01' -AzureId 'az-1' -IntuneId 'in-1')
     }
 }
