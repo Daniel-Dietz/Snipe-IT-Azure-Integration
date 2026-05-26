@@ -23,9 +23,9 @@ Describe 'repository safety contract' {
         @($Config.Sync.FallbackMatchPriority) | Should -Contain 'DeviceName'
     }
 
-    It 'keeps output paths fully qualified for service execution' {
-        [System.IO.Path]::IsPathFullyQualified($Config.Logging.LogPath) | Should -BeTrue
-        [System.IO.Path]::IsPathFullyQualified($Config.Logging.ReportPath) | Should -BeTrue
+    It 'keeps Windows service output paths configured' {
+        $Config.Logging.LogPath | Should -Match '^[A-Za-z]:/'
+        $Config.Logging.ReportPath | Should -Match '^[A-Za-z]:/'
     }
 
     It 'keeps unsupported destructive operations out of the active script' {
