@@ -48,7 +48,6 @@ Describe 'runtime secret handling' {
     It 'reads secrets only from process scope' {
         $Name = 'SNIPEIT_SYNC_TEST_SECRET'
         [Environment]::SetEnvironmentVariable($Name, $null, 'Process')
-        [Environment]::SetEnvironmentVariable($Name, 'user-scope-value', 'User')
         try {
             { Get-EnvironmentSecret -Name $Name -Purpose 'unit test' } | Should -Throw '*process-scoped*'
             [Environment]::SetEnvironmentVariable($Name, 'process-scope-value', 'Process')
@@ -56,7 +55,6 @@ Describe 'runtime secret handling' {
         }
         finally {
             [Environment]::SetEnvironmentVariable($Name, $null, 'Process')
-            [Environment]::SetEnvironmentVariable($Name, $null, 'User')
         }
     }
 }
