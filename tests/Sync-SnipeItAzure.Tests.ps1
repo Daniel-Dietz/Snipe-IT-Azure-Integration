@@ -40,23 +40,6 @@ Describe 'Snipe-IT Azure sync safety contract' {
     It 'centralizes runtime secret loading through a single function' {
         $ScriptContent | Should -Match 'function Get-EnvironmentSecret'
         $ScriptContent | Should -Match 'function New-RuntimeContext'
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable\(' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
-        ($ScriptContent | Select-String -Pattern 'GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 0
         ($ScriptContent | Select-String -Pattern '\[Environment\]::GetEnvironmentVariable' -AllMatches).Matches.Count | Should -Be 1
     }
 
