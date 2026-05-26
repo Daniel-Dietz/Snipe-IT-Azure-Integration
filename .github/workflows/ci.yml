@@ -50,20 +50,27 @@ jobs:
         run: |
           $results = Invoke-ScriptAnalyzer -Path . -Recurse -Severity Warning,Error
           $results | Format-Table -AutoSize
-          $errors = @($results | Where-Object Severity -eq 'Error')
-          if ($errors.Count -gt 0) { exit 1 }
+          if (@($results).Count -gt 0) { exit 1 }
 
       - name: Run Pester tests
         shell: pwsh
         run: |
           Invoke-Pester -Path ./tests -CI
 
-      - name: Validate JSON files
+      - name: Validate JSON files and configuration schema
         shell: pwsh
         run: |
           Get-ChildItem -Path . -Recurse -Include *.json | ForEach-Object {
-            Write-Host "Validating $($_.FullName)"
+            Write-Output "Validating JSON syntax for $($_.FullName)"
             Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json | Out-Null
+          }
+          if (Get-Command Test-Json -ErrorAction SilentlyContinue) {
+            $schema = Get-Content -LiteralPath ./config.schema.json -Raw
+            $config = Get-Content -LiteralPath ./config.example.json -Raw
+            if (-not (Test-Json -Json $config -Schema $schema)) {
+              Write-Error 'config.example.json does not satisfy config.schema.json.'
+              exit 1
+            }
           }
 
       - name: Basic secret scan
