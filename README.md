@@ -1,26 +1,30 @@
 # Snipe-IT Azure Integration
 
-Production-oriented PowerShell integration to synchronize Microsoft Intune managed device inventory into Snipe-IT with safe defaults, plan/apply execution, structured logging, retry handling, and explicit write controls.
+Production-oriented PowerShell integration to synchronize Microsoft Intune managed device inventory into existing Snipe-IT assets with safe defaults, plan/apply execution, structured logging, retry handling, and explicit update controls.
 
 ## Current safety model
 
 The script is intentionally conservative:
 
+- Windows-only execution is enforced because certificate-thumbprint authentication uses the Windows certificate store
 - no secrets are stored in the repository or in `config.json`
+- secrets are read only from process-scoped environment variables
 - `Plan` mode is the default and performs no Snipe-IT writes
-- writes require `Apply` mode plus `-AllowCreate` and/or `-AllowUpdate`
-- archive/delete lifecycle actions are not implemented and are not exposed
+- writes require `Apply` mode plus `-AllowUpdate`
+- create, archive, and delete lifecycle actions are not implemented and are not exposed
 - only Intune managed devices are supported because Entra device objects do not reliably contain serial numbers
-- Snipe-IT asset tags and procurement fields are not synchronized by default
-- duplicate Azure or Snipe-IT match keys are blocked instead of guessed
+- unique matching uses serial number, Azure device ID, and Intune device ID
+- device name is treated only as an ambiguous fallback match key
 - transient API failures are retried with exponential backoff and `Retry-After` support
 - sensitive values are recursively redacted from logs and reports
+- log/report directories are validated before use
+- a lock file prevents concurrent runs for the same configuration
 
 ## Requirements
 
-- PowerShell 7.2 or newer
+- Windows with PowerShell 7.2 or newer
 - Network access to Snipe-IT and Microsoft Graph
-- Snipe-IT API token with the minimum required asset permissions
+- Snipe-IT API token with the minimum required asset update permissions
 - Microsoft Entra application registration using certificate authentication
 - Microsoft Graph PowerShell `Microsoft.Graph.Authentication` module
 
@@ -43,7 +47,7 @@ Copy-Item .\config.example.json .\config.json
 notepad .\config.json
 ```
 
-Provide secrets via environment variables or a secure secret source:
+Provide secrets as process-scoped environment variables in the launching process or scheduled task action:
 
 ```powershell
 $env:SNIPEIT_API_TOKEN = '<token>'
@@ -58,23 +62,23 @@ Run a plan-only execution first:
 pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath .\config.json -Mode Plan -LogLevel Info
 ```
 
-Only enable writes after reviewing the plan report:
+Only enable updates after reviewing the plan report:
 
 ```powershell
-pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath .\config.json -Mode Apply -AllowCreate -AllowUpdate -NonInteractive
+pwsh .\src\Sync-SnipeItAzure.ps1 -ConfigPath C:\ProgramData\SnipeITAzureSync\config.json -Mode Apply -AllowUpdate -NonInteractive
 ```
 
 ## Unsupported lifecycle actions
 
-The script does **not** archive or delete Snipe-IT assets that are missing from Azure/Intune. That behavior was deliberately removed until it can be implemented with robust reconciliation and tests.
+The script does **not** create, archive, or delete Snipe-IT assets. Create mode is disabled until model/status/asset-tag prerequisites are implemented and tested. Missing-asset cleanup is also intentionally unsupported.
 
 ## Logs and reports
 
 The script writes structured JSONL logs and a JSON summary report by default:
 
 ```text
-logs/snipeit-azure-sync.jsonl
-reports/snipeit-azure-sync-report.json
+C:\ProgramData\SnipeITAzureSync\logs\snipeit-azure-sync.jsonl
+C:\ProgramData\SnipeITAzureSync\reports\snipeit-azure-sync-report.json
 ```
 
 Sensitive values are redacted before logging. Protect the log and report directories because they still contain operational inventory metadata such as device names and serial numbers.
@@ -86,7 +90,7 @@ src/Sync-SnipeItAzure.ps1          Main sync script
 config.example.json                Example configuration without secrets
 config.schema.json                 JSON schema for configuration validation
 docs/runbook.md                    Operational runbook
-tests/Sync-SnipeItAzure.Tests.ps1  Pester safety contract tests
+tests/Sync-SnipeItAzure.Tests.ps1  Pester behavior tests
 .github/workflows/ci.yml           CI checks
 ```
 
@@ -101,9 +105,10 @@ tests/Sync-SnipeItAzure.Tests.ps1  Pester safety contract tests
 | 4 | API connectivity failure |
 | 5 | Validation failure |
 | 6 | Partial sync failure |
+| 8 | Concurrent run blocked |
 
 ## Commit message
 
 ```text
-Harden Snipe-IT Azure sync safety contract
+Harden Snipe-IT Azure sync runtime
 ```
