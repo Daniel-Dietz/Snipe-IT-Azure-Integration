@@ -114,63 +114,75 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Run Windows behavior tests
+      - name: Verify module and configuration load
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          function Assert-Condition {
-            param([bool]$Condition, [string]$Message)
-            Write-Output "CHECK: $Message"
-            if (-not $Condition) { throw "FAILED CHECK: $Message" }
-          }
-
-          Write-Output 'Loading module and configuration.'
-          $modulePath = Resolve-Path './src/SnipeItAzureSync.psm1'
-          $configPath = Resolve-Path './config.example.json'
-          $schemaPath = Resolve-Path './config.schema.json'
-          $moduleSource = Get-Content -LiteralPath $modulePath -Raw
-          $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+          $modulePath = (Resolve-Path './src/SnipeItAzureSync.psm1').Path
+          $configPath = (Resolve-Path './config.example.json').Path
+          $schemaPath = (Resolve-Path './config.schema.json').Path
+          Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json | Out-Null
           Get-Content -LiteralPath $schemaPath -Raw | ConvertFrom-Json | Out-Null
           Import-Module -Name $modulePath -Force
-
-          Write-Output 'Running module export checks.'
           $exported = @(Get-Command -Module SnipeItAzureSync | Select-Object -ExpandProperty Name)
-          Assert-Condition ($exported.Count -eq 1 -and $exported[0] -eq 'Invoke-SnipeItAzureSync') 'Module must export only Invoke-SnipeItAzureSync.'
+          if ($exported.Count -ne 1 -or $exported[0] -ne 'Invoke-SnipeItAzureSync') { throw 'Module must export only Invoke-SnipeItAzureSync.' }
+          Write-Output 'Module and configuration load checks passed.'
 
-          Write-Output 'Running configuration policy checks.'
-          Assert-Condition ($config.Sync.Mode -eq 'Plan') 'Example configuration must default to Plan mode.'
-          Assert-Condition (-not ($config.Sync.UniqueMatchPriority -contains 'DeviceName')) 'DeviceName must not be a unique match key.'
-          Assert-Condition ($config.Sync.FallbackMatchPriority -contains 'DeviceName') 'DeviceName must remain fallback-only.'
-          Assert-Condition ($config.Sync.UniqueMatchPriority -contains 'AzureDeviceId') 'AzureDeviceId must remain a unique matching key.'
-          Assert-Condition ($config.Sync.UniqueMatchPriority -contains 'IntuneDeviceId') 'IntuneDeviceId must remain a unique matching key.'
-
-          Write-Output 'Running field mapping checks.'
+      - name: Verify matching configuration contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $config = Get-Content -LiteralPath './config.example.json' -Raw | ConvertFrom-Json
+          if ($config.Sync.Mode -ne 'Plan') { throw 'Example configuration must default to Plan mode.' }
+          if ($config.Sync.UniqueMatchPriority -contains 'DeviceName') { throw 'DeviceName must not be a unique match key.' }
+          foreach ($required in @('AzureDeviceId', 'IntuneDeviceId')) {
+            if ($config.Sync.UniqueMatchPriority -notcontains $required) { throw "$required must remain a unique matching key." }
+          }
+          if ($config.Sync.FallbackMatchPriority -notcontains 'DeviceName') { throw 'DeviceName must remain fallback-only.' }
           $enabledFields = @($config.Sync.UniqueMatchPriority) + @($config.Sync.FallbackMatchPriority) + @($config.Sync.UpdateFields)
           foreach ($field in @($enabledFields | Select-Object -Unique)) {
-            Assert-Condition ($config.FieldMappings.PSObject.Properties.Name -contains $field) "Missing FieldMappings entry for $field."
-            Assert-Condition (-not [string]::IsNullOrWhiteSpace([string]$config.FieldMappings.$field)) "Empty FieldMappings entry for $field."
+            if ($config.FieldMappings.PSObject.Properties.Name -notcontains $field) { throw "Missing FieldMappings entry for $field." }
+            if ([string]::IsNullOrWhiteSpace([string]$config.FieldMappings.$field)) { throw "Empty FieldMappings entry for $field." }
           }
+          Write-Output 'Matching configuration contract checks passed.'
 
-          Write-Output 'Running update-only API contract checks.'
-          Assert-Condition ($moduleSource -match "ValidateSet\('GET', 'PATCH'\)") 'Snipe-IT request method set must remain update-only.'
-          Assert-Condition ($moduleSource -notmatch "ValidateSet\('GET', 'POST'") 'POST must not be enabled for Snipe-IT API calls.'
-          Assert-Condition ($moduleSource -notmatch "ValidateSet\('GET', 'DELETE'") 'DELETE must not be enabled for Snipe-IT API calls.'
-          Assert-Condition ($moduleSource -match 'Apply mode requires explicit -AllowUpdate') 'Apply mode must require explicit update permission.'
-          Assert-Condition ($moduleSource -match 'if \(-not \$Script:Runtime.AllowUpdate\)') 'Runtime update permission gate is missing.'
+      - name: Verify update-only API contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $moduleSource = Get-Content -LiteralPath './src/SnipeItAzureSync.psm1' -Raw
+          if ($moduleSource -notmatch "ValidateSet\('GET', 'PATCH'\)") { throw 'Snipe-IT request method set must remain update-only.' }
+          if ($moduleSource -match "ValidateSet\('GET', 'POST'") { throw 'POST must not be enabled for Snipe-IT API calls.' }
+          if ($moduleSource -match "ValidateSet\('GET', 'DELETE'") { throw 'DELETE must not be enabled for Snipe-IT API calls.' }
+          if ($moduleSource -notmatch 'Apply mode requires explicit -AllowUpdate') { throw 'Apply mode must require explicit update permission.' }
+          if ($moduleSource -notmatch 'if \(-not \$Script:Runtime.AllowUpdate\)') { throw 'Runtime update permission gate is missing.' }
+          Write-Output 'Update-only API contract checks passed.'
 
-          Write-Output 'Running validation and path-safety checks.'
-          Assert-Condition ($moduleSource -match 'function Assert-SyncConfigShape') 'Runtime configuration shape validation is missing.'
-          Assert-Condition ($moduleSource -match 'Snipe-IT BaseUrl must use HTTPS') 'HTTPS validation is missing.'
-          Assert-Condition ($moduleSource -match 'function Assert-SafeOutputParentPath') 'Safe output parent validation is missing.'
-          Assert-Condition ($moduleSource.IndexOf('Assert-SafeOutputParentPath -Directory $Directory') -ge 0) 'Output parent validation call is missing.'
-          Assert-Condition ($moduleSource.IndexOf('New-Item -ItemType Directory -Path $Directory') -ge 0) 'Output directory creation call is missing.'
-          Assert-Condition ($moduleSource.IndexOf('Assert-SafeOutputParentPath -Directory $Directory') -lt $moduleSource.IndexOf('New-Item -ItemType Directory -Path $Directory')) 'Output parent path must be validated before directory creation.'
+      - name: Verify validation and path-safety contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $moduleSource = Get-Content -LiteralPath './src/SnipeItAzureSync.psm1' -Raw
+          if ($moduleSource -notmatch 'function Assert-SyncConfigShape') { throw 'Runtime configuration shape validation is missing.' }
+          if ($moduleSource -notmatch 'Snipe-IT BaseUrl must use HTTPS') { throw 'HTTPS validation is missing.' }
+          if ($moduleSource -notmatch 'function Assert-SafeOutputParentPath') { throw 'Safe output parent validation is missing.' }
+          $parentIndex = $moduleSource.IndexOf('Assert-SafeOutputParentPath -Directory $Directory')
+          $createIndex = $moduleSource.IndexOf('New-Item -ItemType Directory -Path $Directory')
+          if ($parentIndex -lt 0) { throw 'Output parent validation call is missing.' }
+          if ($createIndex -lt 0) { throw 'Output directory creation call is missing.' }
+          if ($parentIndex -ge $createIndex) { throw 'Output parent path must be validated before directory creation.' }
+          Write-Output 'Validation and path-safety contract checks passed.'
 
-          Write-Output 'Running serialless matching checks.'
-          Assert-Condition ($moduleSource -match "if \(\$KeyName -eq 'SerialNumber' -and \(Test-BadSerialNumber") 'Serialless matching guard is missing.'
-          Assert-Condition ($moduleSource -match 'AzureDeviceId') 'AzureDeviceId handling is missing.'
-          Assert-Condition ($moduleSource -match 'IntuneDeviceId') 'IntuneDeviceId handling is missing.'
-          Write-Output 'Windows behavior contract checks passed.'
+      - name: Verify serialless matching contract
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $moduleSource = Get-Content -LiteralPath './src/SnipeItAzureSync.psm1' -Raw
+          if ($moduleSource -notmatch "if \(\$KeyName -eq 'SerialNumber' -and \(Test-BadSerialNumber") { throw 'Serialless matching guard is missing.' }
+          foreach ($required in @('AzureDeviceId', 'IntuneDeviceId')) {
+            if ($moduleSource -notmatch $required) { throw "$required handling is missing." }
+          }
+          Write-Output 'Serialless matching contract checks passed.'
 
   certification-gate:
     name: Certification gate
