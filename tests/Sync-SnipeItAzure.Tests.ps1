@@ -4,6 +4,10 @@ BeforeAll {
     $ExampleSchemaPath = Join-Path $RepoRoot 'config.schema.json'
     $ScriptPath = Join-Path $RepoRoot 'src/Sync-SnipeItAzure.ps1'
     $ExampleConfig = Get-Content -LiteralPath $ExampleConfigPath -Raw | ConvertFrom-Json
+    $ExampleConfig.Logging.LogPath = Join-Path $TestDrive 'logs/out.jsonl'
+    $ExampleConfig.Logging.ReportPath = Join-Path $TestDrive 'reports/out.json'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $ExampleConfig.Logging.LogPath) -Force | Out-Null
+    New-Item -ItemType Directory -Path (Split-Path -Parent $ExampleConfig.Logging.ReportPath) -Force | Out-Null
     $RuntimeScriptPath = Join-Path $TestDrive 'Sync-SnipeItAzure.Runtime.ps1'
     $RuntimeScript = Get-Content -LiteralPath $ScriptPath -Raw
     $RuntimeScript = $RuntimeScript -replace "(?s)if \(\$MyInvocation\.InvocationName -ne '\.'\) \{ Invoke-Main \}\s*$", ''
